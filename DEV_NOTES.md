@@ -33,7 +33,7 @@ Output: DB tables in `quest_ple_analytics` (default) and/or CSV files.
 | `README.md` | Done | Full technical documentation |
 | `DEV_NOTES.md` | This file | Development log |
 
-**Pipeline runs successfully.** Tested with single user `04d9c06e-1a37-428e-9b38-c0243b86544d`.
+**Pipeline runs successfully.** Tested with a single PLE user (see Test User section below).
 
 ---
 
@@ -102,7 +102,7 @@ Output: DB tables in `quest_ple_analytics` (default) and/or CSV files.
 - **Rule**: Each PLE user must have exactly ONE career path: the most recently updated active one.
 - **SQL fix**: `ple_career_path_user` is now wrapped in a derived table using `ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY updated_at DESC)` — only `rn = 1` row is joined. This enforces the constraint at the DB level, not in Python.
 - **Python dedup** (safety net): `fetch_allocation()` still deduplicates on `(user_id, lesson_id)` sorted by `career_path_updated_at DESC` as a safety net for any edge cases (e.g. same timestamp on two records).
-- Root cause: user `04d9c06e` had 2 active career paths. Old approach joined both → 625 rows for 342 unique lessons. With the SQL fix, only "I want to work in a Company" (more recently updated) is joined.
+- Root cause: test user had 2 active career paths. Old approach joined both → 625 rows for 342 unique lessons. With the SQL fix, only the more recently updated career path is joined.
 
 ---
 
@@ -232,13 +232,14 @@ python main.py --centre-id <uuid> --dry-run
 ### SSH Tunnel Details
 | | Source DB | Analytics DB |
 |---|---|---|
-| Bastion IP | `52.66.225.6` | `15.206.29.129` |
-| SSH User | `joseph_prod` | `ubuntu` |
-| PEM file | `joseph_prod.pem` | `superset_baston_server.pem` |
-| RDS Host | `quest-app-production-db.cclvmixcvzas.ap-south-1.rds.amazonaws.com` | `quest-analytics-superset.cclvmixcvzas.ap-south-1.rds.amazonaws.com` |
+| Bastion IP | `SOURCE_SSH_HOST` (see `.env`) | `DEST_SSH_HOST` (see `.env`) |
+| SSH User | `SOURCE_SSH_USER` (see `.env`) | `DEST_SSH_USER` (see `.env`) |
+| PEM file | `SOURCE_SSH_PKEY_FILE` (see `.env`) | `DEST_SSH_PKEY_FILE` (see `.env`) |
+| RDS Host | `SOURCE_RDS_HOST` (see `.env`) | `DEST_RDS_HOST` (see `.env`) |
 | DB Name | `quest_rearch_production` | `quest_ple_analytics` |
-| DB User | `joseph` | `talend_user` |
+| DB User | `SOURCE_DB_USER` (see `.env`) | `DEST_DB_USER` (see `.env`) |
 
+All connection details are stored in `.env` (gitignored). Copy `.env.example` and fill in the values.  
 PEM files must be placed in `ael_v2_pipeline/DB_Config/` (gitignored).
 
 ### Running for the First Time
@@ -250,7 +251,7 @@ pip install -r requirements.txt
 cp .env.example .env
 # fill in SOURCE_DB_PASSWORD and DEST_DB_PASSWORD in .env
 # copy .pem files into DB_Config/
-python main.py --user-id 04d9c06e-1a37-428e-9b38-c0243b86544d --dry-run
+python main.py --user-id <test-user-uuid> --dry-run
 ```
 
 ---
@@ -318,17 +319,19 @@ These were not discussed yet — bring them up in the next session if needed:
 
 ## Test User
 
+A PLE learner (type 3) with 2 active career paths was used to validate the pipeline. Real UUIDs are stored locally and must not be committed.
+
 ```
-user_id : 04d9c06e-1a37-428e-9b38-c0243b86544d
-name    : shubham sen
+user_id : <redacted — see .env or ask team>
+name    : <redacted>
 type    : 3 (learner)
 is_ple  : 1 (PLE user)
-centre  : 0dd48495-0d5f-4663-8b08-a78bc1e2d19c
-batch   : 096b21a6-bf16-436f-92a5-42b46a01b336
-career paths: 2 active paths (freelancer + company)
+centre  : <redacted>
+batch   : <redacted>
+career paths: 2 active paths
 ```
 
-After deduplication: 342 unique allocated lessons
+After deduplication: 342 unique allocated lessons  
 Expected output rows (completed=1): varies by actual completions in `learning_activities`
 
 
