@@ -263,15 +263,11 @@ def write_table(
     with _connect(cfg) as conn:
         with conn.cursor() as cur:
             if if_exists == "replace":
-                try:
-                    cur.execute(f"TRUNCATE TABLE `{table}`")
-                    log.debug("TRUNCATE %s", table)
-                except pymysql.err.ProgrammingError as exc:
-                    if exc.args[0] != 1146:  # 1146 = table doesn't exist
-                        raise
-                    # First run — table doesn't exist yet; create it from the DataFrame schema
-                    cur.execute(_create_table_sql(table, df))
-                    log.info("Created table %s (first run)", table)
+                # DROP + CREATE ensures the schema always matches the current DataFrame.
+                # TRUNCATE would keep the old schema and break when new columns are added.
+                cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+                cur.execute(_create_table_sql(table, df))
+                log.debug("Recreated table %s", table)
 
             for i in range(0, len(rows), CHUNK_SIZE):
                 batch = rows[i : i + CHUNK_SIZE]
