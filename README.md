@@ -104,14 +104,14 @@ quest_analytics (analytics DB — write only)
 
 - Python 3.11+
 - SSH access to both bastion hosts (`.pem` key files):
-  - `joseph_prod.pem` — source DB bastion (`52.66.225.6`)
-  - `superset_baston_server.pem` — analytics DB bastion (`15.206.29.129`)
+  - `<source-key>.pem` — source DB bastion (<bastion ip>)
+  - `<dest-key>.pem` — analytics DB bastion (<bastion ip>)
 - Both `.pem` files must be placed inside `DB_Config/` within the pipeline folder:
   ```
   ael_v2_pipeline/
   ├── DB_Config/
-  │   ├── joseph_prod.pem
-  │   └── superset_baston_server.pem
+  │   ├── <source-key>.pem
+  │   └── <dest-key>.pem
   └── ...
   ```
 - Network access to both bastion IPs (VPN or office network as required)
@@ -183,7 +183,7 @@ DEST_RDS_PORT=3306
 
 DEST_DB_USER=<db-username>
 DEST_DB_PASSWORD=                       # ← fill this in
-DEST_DB_NAME=quest_ple_analytics
+DEST_DB_NAME=quest_analytics
 
 # ── Output ────────────────────────────────────────────────────
 OUTPUT_DIR=output
