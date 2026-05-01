@@ -291,7 +291,8 @@ def fetch_allocation(
     ple["allocation_path"]      = "ple"
     ple["allocation_basis"]     = "centre_subject → subject_ple_career_path → batch_subject"
 
-    combined = pd.concat([non_ple, ple], ignore_index=True)
+    parts    = [df for df in [non_ple, ple] if not df.empty]
+    combined = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
     before = len(combined)
 
     # A user enrolled in multiple career paths will produce one row per path

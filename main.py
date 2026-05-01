@@ -42,8 +42,11 @@ completed = 0, total_completed_lessons = 0, completion_pct = 0.0.
 """
 
 import argparse
+import gzip
 import logging
+import logging.handlers
 import os
+import shutil
 import sys
 from datetime import datetime
 
@@ -62,6 +65,33 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("main")
+
+_LOG_FMT = logging.Formatter(
+    "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+
+def _setup_file_logging(log_path: str) -> None:
+    """
+    Add a daily-rotating gzip-compressed file handler to the root logger.
+    Active log: <log_path>
+    Rotated logs: <log_path>.YYYY-MM-DD.gz  (kept for 30 days)
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+    handler = logging.handlers.TimedRotatingFileHandler(
+        log_path, when="midnight", backupCount=30, encoding="utf-8",
+    )
+    handler.setFormatter(_LOG_FMT)
+
+    def _rotator(source, dest):
+        with open(source, "rb") as f_in, gzip.open(dest, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+        os.remove(source)
+
+    handler.rotator = _rotator
+    handler.namer   = lambda name: name + ".gz"
+    logging.getLogger().addHandler(handler)
 
 # Lesson-level detail table (one row per user × completed lesson)
 OUTPUT_TABLE_LESSON   = "main_learning_activity_myquest_ael_lesson"
@@ -106,6 +136,16 @@ def parse_args():
         ),
     )
     p.add_argument("--dry-run", action="store_true", help="Print row counts only, no output written")
+    p.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write logs to this file in addition to stdout. "
+            "Rotates daily at midnight; old files are gzip-compressed automatically. "
+            "Example: --log-file /home/joseph/logs/ael_pipeline.log"
+        ),
+    )
     return p.parse_args()
 
 
@@ -324,11 +364,13 @@ def run(
             len(all_user_ids), n_chunks, ALLOC_CHUNK_SIZE,
         )
 
-    first_write  = True           # replace on first chunk, append on the rest
-    summary_rows = []             # accumulates one row per user for final report
-    _no_alloc_keep = [c for c in ["user_id", "user_name", "user_type",
-                                   "centre_id", "project_id", "batch_id", "trade_id"]
-                      if c in users_df.columns]
+    first_write    = True           # replace on first chunk, append on the rest
+    summary_rows   = []             # accumulates one row per user for final report
+    no_alloc_rows  = []             # accumulates no-allocation users across all chunks
+    _no_alloc_keep = [c for c in [
+        "user_id", "user_name", "user_type", "centre_id", "project_id",
+        "is_ple", "batch_id", "trade_id",
+    ] if c in users_df.columns]
 
     for chunk_idx, chunk_ids in enumerate(chunks, 1):
         if n_chunks > 1:
@@ -388,6 +430,7 @@ def run(
             stub["completed"]               = 0
             result = pd.concat([result, stub], ignore_index=True, sort=False) if not result.empty else stub
             log.info("Added %d users with no allocation (stub rows)", len(stub))
+            no_alloc_rows.append(stub[_no_alloc_keep].copy())
 
         if result.empty:
             continue
@@ -450,6 +493,18 @@ def run(
 
         first_write = False
 
+    # ── Save no-allocation user list ──────────────────────────────────────────
+    if no_alloc_rows and not dry_run:
+        no_alloc_df = pd.concat(no_alloc_rows, ignore_index=True).drop_duplicates("user_id")
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        ts            = datetime.now().strftime("%Y%m%d_%H%M%S")
+        no_alloc_path = os.path.join(OUTPUT_DIR, f"no_alloc_users_{ts}.csv")
+        no_alloc_df.to_csv(no_alloc_path, index=False)
+        log.info(
+            "No-allocation users saved → %s  (%d users — had completions but no current allocation)",
+            no_alloc_path, len(no_alloc_df),
+        )
+
     # ── Final summary ─────────────────────────────────────────────────────────
     if summary_rows:
         if n_chunks > 1:
@@ -467,6 +522,8 @@ def run(
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.log_file:
+        _setup_file_logging(args.log_file)
     df   = run(
         user_id=args.user_id,
         centre_id=args.centre_id,
