@@ -497,6 +497,7 @@ Completion data is fetched from `quest_rearch_production` directly (not from the
 The query filters `WHERE completed = 1` at the SQL level, then aggregates per `(user_id, lesson_id)` pair:
 - `MAX(score)` — best score across all completed attempts
 - `MAX(rating)` — best rating across all completed attempts
+- `SUM(duration)` — total time spent on this lesson across all completed attempts
 - `NULL AS data_from` — this column does not exist in the source tables
 
 `main.py` derives the exact `user_types` present in the allocation result and passes them to `fetch_completion()`, so the correct tables are always queried.
@@ -515,7 +516,7 @@ The `_SQL` query in `s3_completion.py` includes `WHERE completed = 1`. Only rows
 - A lesson **allocated** and **has a `completed = 1` record** → `completed = 1` in the output
 - A lesson completed by the user but **not in their allocation** → excluded entirely (LEFT JOIN from allocation side)
 
-**Summary stats are computed on the full merged dataset** (before the Python-level filter) so that `total_allocated_lessons`, `total_completed_lessons`, and `completion_pct` accurately reflect the user's full picture. The final returned DataFrame then contains only `completed = 1` rows.
+**Summary stats are computed on the full merged dataset** (before the Python-level filter) so that `total_allocated`, `total_completed`, and `completion_pct` accurately reflect the user's full picture. The final returned DataFrame then contains only `completed = 1` rows.
 
 This two-layer approach ensures both data quality (no partial views inflating counts) and accurate allocation coverage tracking.
 
@@ -552,13 +553,18 @@ One row per **user × completed lesson**. Users with zero completions get a sing
 | `is_assessment` | int | 1 = assessment lesson, 0 = learning content |
 | `toolkit_type` | string | `student` / `facilitator` / `master` |
 | `allocation_path` | string | `ple` or `non_ple` — which path allocated this row |
-| `score` | float | Best score from `learning_activities` (NULL if not available) |
+| `score` | float | Best score from `learning_activities` (NULL if not attempted) |
 | `rating` | float | Best rating (NULL if not rated) |
+| `duration` | int | Total time spent on this lesson across all completed attempts (seconds) |
 | `data_from` | string | Always NULL — column not present in source activity tables |
 | `completed` | int | `1` = lesson completed; `0` = zero-completion stub row |
-| `total_allocated_lessons` | int | Total lessons allocated to this user (pre-filter) |
-| `total_completed_lessons` | int | Lessons completed out of their allocation |
-| `completion_pct` | float | `(completed / allocated) × 100`, rounded to 2 dp |
+| `total_allocated` | int | All lessons allocated to this user across all subjects |
+| `total_lessons_allocated` | int | Non-assessment lessons allocated to this user |
+| `total_assessments_allocated` | int | Assessment lessons allocated to this user |
+| `total_completed` | int | All lessons completed by this user |
+| `total_lessons_completed` | int | Non-assessment lessons completed by this user |
+| `total_assessments_completed` | int | Assessment lessons completed by this user |
+| `completion_pct` | float | `(total_completed / total_allocated) × 100`, rounded to 2 dp |
 | `subj_total_allocated` | int | Total lessons allocated in this subject for this user |
 | `subj_lessons_allocated` | int | Non-assessment lessons allocated in this subject |
 | `subj_assessments_allocated` | int | Assessment lessons allocated in this subject |
@@ -566,7 +572,9 @@ One row per **user × completed lesson**. Users with zero completions get a sing
 | `subj_lessons_completed` | int | Non-assessment lessons completed in this subject |
 | `subj_assessments_completed` | int | Assessment lessons completed in this subject |
 
-**Zero-completion stub rows:** Users allocated lessons but with no `completed = 1` records appear as a single row with `completed = 0`. All lesson and subject-specific columns (`subject_id`, `lesson_id`, `lesson_name`, `score`, etc.) are NULL. The user-level stats (`total_allocated_lessons`, `total_completed_lessons = 0`, `completion_pct = 0.0`) are filled in. This ensures every allocated user appears in the output even if they haven't started any lessons.
+> **`is_assessment` detection:** A lesson is classified as an assessment if `lessons.is_assessment = 1` in the DB **or** if the lesson name contains the word "ASSESSMENT" (case-insensitive). This catches lessons where the flag was never set in the source table.
+
+**Zero-completion stub rows:** Users allocated lessons but with no `completed = 1` records appear as a single row with `completed = 0`. All lesson and subject-specific columns (`subject_id`, `lesson_id`, `lesson_name`, `score`, etc.) are NULL. The user-level stats (`total_allocated`, `total_completed = 0`, `completion_pct = 0.0`) are filled in. This ensures every allocated user appears in the output even if they haven't started any lessons.
 
 ---
 
@@ -590,17 +598,23 @@ One row per **user × subject**. This is the primary analytics table. Zero-compl
 | `subject_is_ple` | int | PLE flag (0 / 1 / 2) |
 | `year_to_map` | int | Year restriction on the subject |
 | `allocation_basis` | string | Which mapping tables allocated this subject |
-| `total_allocated_lessons` | int | User's total allocated lessons across all subjects |
-| `total_completed_lessons` | int | User's total completed lessons across all subjects |
-| `completion_pct` | float | User-level completion percentage |
+| `total_allocated` | int | All lessons allocated to this user across all subjects |
+| `total_lessons_allocated` | int | Non-assessment lessons allocated to this user |
+| `total_assessments_allocated` | int | Assessment lessons allocated to this user |
+| `total_completed` | int | All lessons completed by this user |
+| `total_lessons_completed` | int | Non-assessment lessons completed by this user |
+| `total_assessments_completed` | int | Assessment lessons completed by this user |
+| `completion_pct` | float | `(total_completed / total_allocated) × 100`, rounded to 2 dp |
 | `subj_total_allocated` | int | Total lessons allocated in this subject |
-| `subj_lessons_allocated` | int | Non-assessment lessons allocated |
-| `subj_assessments_allocated` | int | Assessment lessons allocated |
+| `subj_lessons_allocated` | int | Non-assessment lessons allocated in this subject |
+| `subj_assessments_allocated` | int | Assessment lessons allocated in this subject |
 | `subj_total_completed` | int | Lessons completed in this subject |
-| `subj_lessons_completed` | int | Non-assessment lessons completed |
-| `subj_assessments_completed` | int | Assessment lessons completed |
-| `avg_score` | float | Average score across completed assessments in this subject |
+| `subj_lessons_completed` | int | Non-assessment lessons completed in this subject |
+| `subj_assessments_completed` | int | Assessment lessons completed in this subject |
+| `avg_score` | float | Average score across completed lessons in this subject |
 | `avg_rating` | float | Average rating across completed lessons in this subject |
+| `avg_duration` | float | Average time per completed lesson in this subject (seconds) |
+| `total_duration` | int | Total time spent across all completed lessons in this subject (seconds) |
 
 ---
 
@@ -698,6 +712,7 @@ python main.py --centre-id <uuid> --batch-id <uuid>          # combined filter
 python main.py --trade-id <uuid>                             # all users in a trade
 python main.py --subject-id <uuid>                           # all users, single subject only
 python main.py --since "2026-04-30 00:00:00"                 # incremental: only changed users
+python main.py --log-file /home/joseph/logs/ael.log          # also write compressed log to file
 ```
 
 ### Controlling Which Files Are Written
@@ -749,6 +764,31 @@ python main.py --centre-id <uuid> --dry-run
 ```
 
 > In the multi-chunk summary, `no-alloc` counts users who appear in the `users` table but have no allocation (missing batch, trade, or career path mapping). They appear as single stub rows in the output.
+
+### Compressed Log File
+
+Add `--log-file <path>` to write logs to a file in addition to stdout. The file rotates daily at midnight and old logs are gzip-compressed automatically:
+
+```bash
+python main.py --log-file /home/joseph/logs/ael_pipeline.log
+```
+
+- Active log: `ael_pipeline.log` (plain text, today's entries)
+- Rotated logs: `ael_pipeline.log.YYYY-MM-DD.gz` (gzip-compressed, kept for 30 days)
+
+Recommended for cron jobs — add `--log-file` to your cron command so every run is recorded without stdout filling up system logs.
+
+### No-Allocation User Report
+
+After every run (except dry runs), if any users had completions in `learning_activities` but no current allocation, the pipeline automatically saves their details to:
+
+```
+output/no_alloc_users_<timestamp>.csv
+```
+
+Columns: `user_id`, `user_name`, `user_type`, `centre_id`, `is_ple`, `batch_id`, `trade_id`
+
+Use this file to investigate why these users are not in any allocation table — common causes are a missing `batch_id` or `trade_id` in `student_details`, or their batch/trade/career path mapping was removed.
 
 ---
 
