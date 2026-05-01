@@ -252,13 +252,15 @@ def _build_subject_agg(df: pd.DataFrame) -> pd.DataFrame:
             **{c: (c, "first") for c in first_cols},
             avg_score     =("score",    "mean"),
             avg_rating    =("rating",   "mean"),
-            avg_duration  =("duration", "mean"),
-            total_duration=("duration", "sum"),
+            **( {"avg_duration":   ("duration", "mean"),
+                  "total_duration": ("duration", "sum")}
+                if "duration" in df.columns else {} ),
         )
     )
-    agg["avg_score"]    = agg["avg_score"].round(2)
-    agg["avg_rating"]   = agg["avg_rating"].round(2)
-    agg["avg_duration"] = agg["avg_duration"].round(2)
+    agg["avg_score"]  = agg["avg_score"].round(2)
+    agg["avg_rating"] = agg["avg_rating"].round(2)
+    if "avg_duration" in agg.columns:
+        agg["avg_duration"] = agg["avg_duration"].round(2)
     return agg
 
 

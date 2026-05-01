@@ -163,7 +163,7 @@ def merge_completion(allocation: pd.DataFrame, completion: pd.DataFrame) -> pd.D
                  len(user_ids), user_types)
         completion = fetch_completion(user_ids=user_ids, user_types=user_types)
 
-    completion_cols = completion[["user_id", "lesson_id", "score", "rating", "data_from"]].copy()
+    completion_cols = completion[["user_id", "lesson_id", "score", "rating", "data_from", "duration"]].copy()
     completion_cols["_matched"] = 1
 
     merged = allocation.merge(completion_cols, on=["user_id", "lesson_id"], how="left")
