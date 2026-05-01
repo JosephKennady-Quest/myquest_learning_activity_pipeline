@@ -801,6 +801,10 @@ python main.py --since "2026-04-30 00:00:00" --dry-run
 
 # Incremental with CSV output for inspection
 python main.py --since "2026-04-30 00:00:00" --output csv
+
+# Run every night at 2am, pick up everything completed since yesterday 2am
+python main.py --since "$(date -d '24 hours ago' '+%Y-%m-%d %H:%M:%S')"
+
 ```
 
 **Log output for a typical incremental run:**
@@ -859,9 +863,6 @@ python main.py
 
 # 2. From the next day onwards — incremental daily runs (minutes)
 python main.py --since "2026-04-30 00:00:00"
-# Run every night at 2am, pick up everything completed since yesterday 2am
-python main.py --since "$(date -d '24 hours ago' '+%Y-%m-%d %H:%M:%S')"
-
 ```
 
 If the output tables are empty or do not exist, running with `--since` will still work correctly: `delete_user_rows()` silently no-ops on a missing table (catches MySQL error 1146), and `write_table()` auto-creates the table on first insert. However, only the changed users will be present — the table will be incomplete. Always start with a full refresh.
