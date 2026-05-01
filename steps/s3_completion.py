@@ -42,7 +42,8 @@ SELECT
     lesson_id,
     MAX(score)      AS score,
     MAX(rating)     AS rating,
-    NULL            AS data_from
+    NULL            AS data_from,
+    SUM(duration)   AS duration
 
 FROM `{table}`
 

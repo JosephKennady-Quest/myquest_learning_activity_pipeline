@@ -50,7 +50,7 @@ _COMMON_SELECT = """
     lt.name                     AS lesson_type,
     CASE
         WHEN l.is_assessment = 1
-          OR UPPER(l.name) LIKE '%ASSESSMENT%' THEN 1
+          OR UPPER(l.name) LIKE '%%ASSESSMENT%%' THEN 1
         ELSE 0
     END                         AS is_assessment,
     CASE
