@@ -33,12 +33,12 @@ Output columns (one row per user × lesson):
   lesson_id, lesson_name, lesson_order, lesson_type,
   is_assessment, toolkit_type, allocation_path,
   score, rating, data_from, completed,
-  total_allocated_lessons, total_completed_lessons, completion_pct,
+  total_allocated, total_completed, completion_pct,
   subj_total_allocated, subj_lessons_allocated, subj_assessments_allocated,
   subj_total_completed, subj_lessons_completed, subj_assessments_completed
 
 Zero-completion users: one stub row per user with lesson/subject fields NULL,
-completed = 0, total_completed_lessons = 0, completion_pct = 0.0.
+completed = 0, total_completed = 0, completion_pct = 0.0.
 """
 
 import argparse
@@ -241,7 +241,9 @@ def _build_subject_agg(df: pd.DataFrame) -> pd.DataFrame:
         "user_id", "user_name", "user_type", "centre_id", "project_id",
         "batch_id", "trade_id", "career_path_id", "career_path_name",
         "subject_id", "subject_name", "subject_is_ple", "year_to_map", "allocation_basis",
-        "total_allocated_lessons", "total_completed_lessons", "completion_pct",
+        "total_allocated", "total_lessons_allocated", "total_assessments_allocated",
+        "total_completed", "total_lessons_completed", "total_assessments_completed",
+        "completion_pct",
         "subj_total_allocated", "subj_lessons_allocated", "subj_assessments_allocated",
         "subj_total_completed", "subj_lessons_completed", "subj_assessments_completed",
     ]
@@ -429,10 +431,14 @@ def run(
                 [_no_alloc_keep]
                 .copy()
             )
-            stub["total_allocated_lessons"] = 0
-            stub["total_completed_lessons"] = 0
-            stub["completion_pct"]          = 0.0
-            stub["completed"]               = 0
+            stub["total_allocated"]             = 0
+            stub["total_lessons_allocated"]     = 0
+            stub["total_assessments_allocated"] = 0
+            stub["total_completed"]             = 0
+            stub["total_lessons_completed"]     = 0
+            stub["total_assessments_completed"] = 0
+            stub["completion_pct"]              = 0.0
+            stub["completed"]                   = 0
             result = pd.concat([result, stub], ignore_index=True, sort=False) if not result.empty else stub
             log.info("Added %d users with no allocation (stub rows)", len(stub))
             no_alloc_rows.append(stub[_no_alloc_keep].copy())

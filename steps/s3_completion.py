@@ -147,8 +147,8 @@ def merge_completion(allocation: pd.DataFrame, completion: pd.DataFrame) -> pd.D
         rating                  — best rating (NULL if not attempted)
         data_from               — last platform: app / web (NULL if not attempted)
         completed               — 1 = activity exists, 0 = not yet attempted
-        total_allocated_lessons — total lessons allocated to this user
-        total_completed_lessons — lessons with at least one activity record
+        total_allocated — total lessons allocated to this user
+        total_completed — lessons with at least one activity record
         completion_pct          — completed / allocated × 100, rounded to 2dp
     """
     if allocation.empty:
@@ -170,16 +170,26 @@ def merge_completion(allocation: pd.DataFrame, completion: pd.DataFrame) -> pd.D
     merged["completed"] = merged["_matched"].fillna(0).astype(int)
     merged.drop(columns=["_matched"], inplace=True)
 
-    # per-user summary
+    # per-user summary — totals + assessment/lesson split for allocated and completed
+    _ia_u = pd.to_numeric(merged["is_assessment"], errors="coerce").fillna(0).astype(int)
     summary = (
-        merged.groupby("user_id", as_index=False)
+        merged.assign(
+            _ia          = _ia_u,
+            _comp_lesson = merged["completed"] * (1 - _ia_u),
+            _comp_assess = merged["completed"] * _ia_u,
+        )
+        .groupby("user_id", as_index=False)
         .agg(
-            total_allocated_lessons=("lesson_id", "count"),
-            total_completed_lessons=("completed", "sum"),
+            total_allocated            =("lesson_id",      "count"),
+            total_lessons_allocated    =("_ia",             lambda x: (x == 0).sum()),
+            total_assessments_allocated=("_ia",             lambda x: (x == 1).sum()),
+            total_completed            =("completed",       "sum"),
+            total_lessons_completed    =("_comp_lesson",    "sum"),
+            total_assessments_completed=("_comp_assess",    "sum"),
         )
     )
     summary["completion_pct"] = (
-        summary["total_completed_lessons"] / summary["total_allocated_lessons"] * 100
+        summary["total_completed"] / summary["total_allocated"] * 100
     ).round(2)
 
     merged = merged.merge(summary, on="user_id", how="left")
@@ -242,8 +252,10 @@ def merge_completion(allocation: pd.DataFrame, completion: pd.DataFrame) -> pd.D
             .copy()
         )
         zero_rows = zero_rows.merge(
-            summary[["user_id", "total_allocated_lessons",
-                      "total_completed_lessons", "completion_pct"]],
+            summary[["user_id",
+                      "total_allocated", "total_lessons_allocated", "total_assessments_allocated",
+                      "total_completed", "total_lessons_completed", "total_assessments_completed",
+                      "completion_pct"]],
             on="user_id", how="left",
         )
         zero_rows["completed"] = 0
