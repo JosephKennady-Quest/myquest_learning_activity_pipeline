@@ -80,10 +80,10 @@ quest_rearch_production (source DB — read only)
         ├── lesson_types                 │
         └── trades                       ┘  ← year_to_map duration filter
         │
-        ├── learning_activities          ┐ Step 3: completion
+        ├── learning_activities             ┐ Step 3: completion
         └── facilitator_learning_activities ┘ (routed by user_type)
 
-quest_ple_analytics (analytics DB — write only)
+quest_analytics (analytics DB — write only)
         ├── main_learning_activity_myquest_ael         ← subject-level output
         └── main_learning_activity_myquest_ael_lesson  ← lesson-level output
 
