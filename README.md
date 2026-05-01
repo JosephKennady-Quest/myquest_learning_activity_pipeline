@@ -617,14 +617,38 @@ source venv/bin/activate
 python main.py
 ```
 
-> **Full refresh** TRUNCATEs both output tables and rewrites every row. On a large deployment (900K+ users) this takes ~5 hours.
+**What full refresh does to the tables:**
+
+The pipeline processes users in chunks of 2,000. On the very first chunk it TRUNCATEs both output tables, then each subsequent chunk appends into the now-empty tables:
+
+| Step | Action |
+|---|---|
+| Chunk 1 | `TRUNCATE` both tables → all existing rows are deleted → insert first 2,000 users |
+| Chunk 2 … N | `INSERT` (append) — adds the next batch of users |
+| End | Both tables contain fresh data for every active user as of today |
+
+**End result:** Both tables are completely rebuilt. Old rows, deleted users, users who changed batch/trade/career path — everything is replaced with current data pulled live from the source DB.
+
+**When to run a full refresh:**
+
+| Situation | Action needed |
+|---|---|
+| First time running on a new server | Full refresh |
+| Allocation data changed (batch, trade, or career path mappings updated) | Full refresh |
+| A subject or lesson was added or removed | Full refresh |
+| Tables got corrupted or are out of sync | Full refresh |
+| Routine daily update (only completion activity changed) | Incremental `--since` — much faster |
+
+> **Important — partial state during the run:** After chunk 1 truncates the tables, both tables are being rebuilt row by row over the next ~5 hours. Any dashboard or report querying the tables during this window will see incomplete data. **Run full refresh during off-hours** (e.g. weekend night or early morning) to avoid this.
+
+> **Full refresh on a 900K+ user deployment takes ~5 hours.** For daily updates use incremental mode — see [Incremental Runs](#incremental-runs).
 
 ### Single User
 
 Returns the complete allocation and completion dataset for one user. Useful for testing and debugging without a full run.
 
 ```bash
-python main.py --user-id 04d9c06e-1a37-428e-9b38-c0243b86544d --output csv
+python main.py --user-id <user-uuid> --output csv
 ```
 
 ### Filter Options
