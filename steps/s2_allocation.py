@@ -48,7 +48,11 @@ _COMMON_SELECT = """
     l.name                      AS lesson_name,
     l.lesson_order,
     lt.name                     AS lesson_type,
-    l.is_assessment,
+    CASE
+        WHEN l.is_assessment = 1
+          OR UPPER(l.name) LIKE '%ASSESSMENT%' THEN 1
+        ELSE 0
+    END                         AS is_assessment,
     CASE
         WHEN l.student_access        = 1 THEN 'student'
         WHEN l.facilitator_access    = 1 THEN 'facilitator'
