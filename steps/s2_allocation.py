@@ -1,17 +1,33 @@
 """
 Step 2 — Build subject + lesson allocation per user.
 
-Allocation hierarchy (INNER JOINs enforce "only common valid records"):
+Allocation is built from centre_subject as the base, then additional
+intersections are applied ONLY if the user has the corresponding data.
+batch_id and trade_id (non-PLE) / career_path and batch_id (PLE) are
+all optional — missing data means that filter is skipped, not that the
+user gets zero allocation.
 
   NON-PLE users (is_ple IS NULL or != 1):
-    centre_subject          — base: subjects available at the user's centre
-    ∩ batch_subject         — subjects active for the user's batch
-    ∩ subject_trade         — subjects mapped to the user's trade
+    centre_subject              — always applied (base)
+    ∩ batch_subject             — only if user has a batch_id
+    ∩ subject_trade             — only if user has a trade_id
+
+    Examples:
+      centre + batch + trade  → 3-way intersection
+      centre + batch only     → 2-way intersection (trade skipped)
+      centre + trade only     → 2-way intersection (batch skipped)
+      centre only             → centre_subject allocation only
 
   PLE users (is_ple = 1):
-    centre_subject          — base: subjects available at the user's centre
-    ∩ subject_ple_career_path — subjects mapped to the user's PLE career path
-    ∩ batch_subject         — subjects active for the user's batch
+    centre_subject              — always applied (base)
+    ∩ subject_ple_career_path   — only if user has an active career path
+    ∩ batch_subject             — only if user has a batch_id
+
+    Examples:
+      centre + career_path + batch → 3-way intersection
+      centre + career_path only    → 2-way intersection (batch skipped)
+      centre + batch only          → 2-way intersection (career path skipped)
+      centre only                  → centre_subject allocation only
 
   Subjects and Lessons:
     status = 1, deleted_at IS NULL
@@ -78,7 +94,8 @@ LEFT JOIN lesson_types lt
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NON-PLE: centre_subject ∩ batch_subject ∩ subject_trade
+# NON-PLE: centre_subject, optionally ∩ batch_subject, optionally ∩ subject_trade
+# Each intersection is applied only when the user has the corresponding data.
 # ─────────────────────────────────────────────────────────────────────────────
 _NON_PLE_SQL = """
 SELECT
@@ -96,19 +113,17 @@ SELECT
 
 FROM users u
 
-JOIN student_details sd
+LEFT JOIN student_details sd
     ON  sd.user_id   = u.id
-    AND sd.batch_id  IS NOT NULL
-    AND sd.trade_id  IS NOT NULL
 
 JOIN centre_subject cs
     ON  cs.centre_id = u.centre_id
 
-JOIN batch_subject bs
+LEFT JOIN batch_subject bs
     ON  bs.batch_id   = sd.batch_id
     AND bs.subject_id = cs.subject_id
 
-JOIN subject_trade st
+LEFT JOIN subject_trade st
     ON  st.trade_id   = sd.trade_id
     AND st.subject_id = cs.subject_id
 
@@ -122,6 +137,8 @@ WHERE u.type        IN ({types})
   AND u.deleted_at  IS NULL
   AND (u.is_ple     IS NULL OR u.is_ple != 1)
   AND s.is_ple      IN (0, 2)
+  AND (sd.batch_id  IS NULL OR bs.subject_id IS NOT NULL)
+  AND (sd.trade_id  IS NULL OR st.subject_id IS NOT NULL)
   AND (s.year_to_map IS NULL OR s.year_to_map = 0 OR t_trade.duration IS NULL OR s.year_to_map <= t_trade.duration)
   {user_clause}
 
@@ -129,7 +146,8 @@ ORDER BY u.id, cs.`order`, l.lesson_order
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PLE: centre_subject ∩ subject_ple_career_path ∩ batch_subject
+# PLE: centre_subject, optionally ∩ subject_ple_career_path, optionally ∩ batch_subject
+# Each intersection is applied only when the user has the corresponding data.
 # ─────────────────────────────────────────────────────────────────────────────
 _PLE_SQL = """
 SELECT
@@ -147,11 +165,10 @@ SELECT
 
 FROM users u
 
-JOIN student_details sd
+LEFT JOIN student_details sd
     ON  sd.user_id  = u.id
-    AND sd.batch_id IS NOT NULL
 
-JOIN (
+LEFT JOIN (
     SELECT user_id, job_type_id,
            updated_at             AS career_path_updated_at,
            ROW_NUMBER() OVER (
@@ -163,18 +180,18 @@ JOIN (
       AND  deleted_at IS NULL
 ) pcpu ON pcpu.user_id = u.id AND pcpu.rn = 1
 
-JOIN ple_career_paths pcp
+LEFT JOIN ple_career_paths pcp
     ON  pcp.id         = pcpu.job_type_id
     AND pcp.deleted_at IS NULL
 
 JOIN centre_subject cs
     ON  cs.centre_id    = u.centre_id
 
-JOIN subject_ple_career_path spcp
+LEFT JOIN subject_ple_career_path spcp
     ON  spcp.ple_career_path_id = pcp.id
     AND spcp.subject_id          = cs.subject_id
 
-JOIN batch_subject bs
+LEFT JOIN batch_subject bs
     ON  bs.batch_id   = sd.batch_id
     AND bs.subject_id = cs.subject_id
 
@@ -188,6 +205,8 @@ WHERE u.type        IN ({types})
   AND u.deleted_at  IS NULL
   AND u.is_ple      = 1
   AND s.is_ple      IN (1, 2)
+  AND (pcp.id       IS NULL OR spcp.subject_id IS NOT NULL)
+  AND (sd.batch_id  IS NULL OR bs.subject_id   IS NOT NULL)
   AND (s.year_to_map IS NULL OR s.year_to_map = 0 OR t_trade.duration IS NULL OR s.year_to_map <= t_trade.duration)
   {user_clause}
 
@@ -243,8 +262,9 @@ def fetch_non_ple_allocation(
     trade_id:   Optional[str]       = None,
 ) -> pd.DataFrame:
     """
-    Subjects allocated to non-PLE users via:
-      centre_subject ∩ batch_subject ∩ subject_trade
+    Subjects allocated to non-PLE users.
+    centre_subject is always the base; batch_subject and subject_trade
+    intersections are applied only when the user has a batch_id / trade_id.
     """
     sql, params = _build(_NON_PLE_SQL, user_id, user_ids, centre_id, batch_id, subject_id, trade_id)
     df = fetch(SOURCE_DB, sql, params)
@@ -261,12 +281,12 @@ def fetch_ple_allocation(
     trade_id:   Optional[str]       = None,
 ) -> pd.DataFrame:
     """
-    Subjects allocated to PLE users via:
-      centre_subject ∩ subject_ple_career_path ∩ batch_subject
-    Only the most recently updated active career path per user is used
-    (enforced via ROW_NUMBER() in the SQL).
-    Note: trade_id filter applies via sd.trade_id — PLE users without a trade
-    will return zero rows when trade_id is specified.
+    Subjects allocated to PLE users.
+    centre_subject is always the base; subject_ple_career_path and
+    batch_subject intersections are applied only when the user has an
+    active career path / batch_id respectively.
+    When a career path exists, only the most recently updated active one
+    is used (enforced via ROW_NUMBER() in the SQL).
     """
     sql, params = _build(_PLE_SQL, user_id, user_ids, centre_id, batch_id, subject_id, trade_id)
     df = fetch(SOURCE_DB, sql, params)
@@ -290,10 +310,10 @@ def fetch_allocation(
     ple     = fetch_ple_allocation(user_id, user_ids, centre_id, batch_id, subject_id, trade_id)
 
     non_ple["allocation_path"]  = "non_ple"
-    non_ple["allocation_basis"] = "centre_subject → batch_subject → subject_trade"
+    non_ple["allocation_basis"] = "centre_subject [→ batch_subject if batch] [→ subject_trade if trade]"
 
     ple["allocation_path"]      = "ple"
-    ple["allocation_basis"]     = "centre_subject → subject_ple_career_path → batch_subject"
+    ple["allocation_basis"]     = "centre_subject [→ subject_ple_career_path if career_path] [→ batch_subject if batch]"
 
     parts    = [df for df in [non_ple, ple] if not df.empty]
     combined = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
