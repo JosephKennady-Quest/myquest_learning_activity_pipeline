@@ -236,7 +236,11 @@ def _compute_subj_alloc_counts(df: pd.DataFrame) -> pd.DataFrame:
 def _build_subject_agg(df: pd.DataFrame) -> pd.DataFrame:
     """Collapse lesson-level result to one row per (user × subject).
     Rows without a subject_id (zero-allocation / zero-completion stubs) are excluded."""
-    df = df[df["subject_id"].notna()] if "subject_id" in df.columns else df
+    if "subject_id" not in df.columns or df.empty:
+        return pd.DataFrame()
+    df = df[df["subject_id"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame()
     identity = [
         "user_id", "user_name", "user_type", "centre_id", "project_id",
         "batch_id", "trade_id", "career_path_id", "career_path_name",
