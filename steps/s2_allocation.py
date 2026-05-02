@@ -297,6 +297,11 @@ def fetch_allocation(
 
     parts    = [df for df in [non_ple, ple] if not df.empty]
     combined = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+    if combined.empty:
+        log.info("[s2_allocation] combined → 0 rows (no allocation found for this filter)")
+        return combined
+
     before = len(combined)
 
     # A user enrolled in multiple career paths will produce one row per path
