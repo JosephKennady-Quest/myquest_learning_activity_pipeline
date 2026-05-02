@@ -379,8 +379,8 @@ def run(
     summary_rows   = []             # accumulates one row per user for final report
     no_alloc_rows  = []             # accumulates no-allocation users across all chunks
     _no_alloc_keep = [c for c in [
-        "user_id", "user_name", "user_type", "centre_id", "project_id",
-        "is_ple", "batch_id", "trade_id",
+        "user_id", "user_name", "user_type", "is_master_trainer",
+        "centre_id", "project_id", "is_ple", "batch_id", "trade_id",
     ] if c in users_df.columns]
 
     for chunk_idx, chunk_ids in enumerate(chunks, 1):

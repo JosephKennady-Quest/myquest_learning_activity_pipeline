@@ -50,4 +50,10 @@ CHUNK_SIZE        = 5000    # DB insert batch size (rows per executemany call)
 ALLOC_CHUNK_SIZE  = 2000    # users per allocation query (prevents OOM on full runs)
 LEARNER_TYPES     = (3, 4)
 LEARNER_TYPES_SQL = ",".join(str(t) for t in LEARNER_TYPES)
+
+STAFF_TYPES       = (1, 2)          # Admin (1), Facilitator / Master Trainer (2)
+STAFF_TYPES_SQL   = ",".join(str(t) for t in STAFF_TYPES)
+
+ALL_TYPES         = STAFF_TYPES + LEARNER_TYPES   # (1, 2, 3, 4)
+ALL_TYPES_SQL     = ",".join(str(t) for t in ALL_TYPES)
 OUTPUT_DIR        = os.getenv("OUTPUT_DIR", "output")

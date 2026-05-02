@@ -1,43 +1,39 @@
 """
 Step 2 — Build subject + lesson allocation per user.
 
-Allocation is built from centre_subject as the base, then additional
-intersections are applied ONLY if the user has the corresponding data.
-batch_id and trade_id (non-PLE) / career_path and batch_id (PLE) are
-all optional — missing data means that filter is skipped, not that the
-user gets zero allocation.
+Three allocation paths, merged in fetch_allocation():
 
-  NON-PLE users (is_ple IS NULL or != 1):
+  NON-PLE learners (type 3/4, is_ple IS NULL or != 1):
     centre_subject              — always applied (base)
     ∩ batch_subject             — only if user has a batch_id
     ∩ subject_trade             — only if user has a trade_id
+    Lessons: student_access = 1
 
-    Examples:
-      centre + batch + trade  → 3-way intersection
-      centre + batch only     → 2-way intersection (trade skipped)
-      centre + trade only     → 2-way intersection (batch skipped)
-      centre only             → centre_subject allocation only
-
-  PLE users (is_ple = 1):
+  PLE learners (type 3/4, is_ple = 1):
     centre_subject              — always applied (base)
     ∩ subject_ple_career_path   — only if user has an active career path
     ∩ batch_subject             — only if user has a batch_id
+    Lessons: student_access = 1
 
-    Examples:
-      centre + career_path + batch → 3-way intersection
-      centre + career_path only    → 2-way intersection (batch skipped)
-      centre + batch only          → 2-way intersection (career path skipped)
-      centre only                  → centre_subject allocation only
+  Staff (type 1 Admin, type 2 Facilitator / Master Trainer):
+    centre_subject only — no batch, trade, or career path filter
+    Lessons:
+      Admin (type 1)                      → all lessons in the centre
+      Facilitator (type 2, not MT)        → facilitator_access = 1
+      Master Trainer (type 2, is_MT = 1)  → mastertrainer_access = 1
+    Completion stored in facilitator_learning_activities.
+
+  For learner paths — batch/trade/career_path are optional:
+    If the relevant data exists → intersection is applied.
+    If missing → that filter is skipped (user still gets centre allocation).
 
   Subjects and Lessons:
     status = 1, deleted_at IS NULL
 
   toolkit_type is derived from access flags on the lessons row:
-    student_access = 1  → 'student'
-    facilitator_access  → 'facilitator'
+    student_access = 1   → 'student'
+    facilitator_access   → 'facilitator'
     mastertrainer_access → 'master'
-
-  Only lessons with student_access = 1 are included (user types 3, 4).
 """
 
 import logging
@@ -51,7 +47,7 @@ from db import fetch
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared lesson + subject columns used in both queries
+# Shared lesson + subject columns — learner queries (t_trade in scope)
 # ─────────────────────────────────────────────────────────────────────────────
 _COMMON_SELECT = """
     s.id                        AS subject_id,
@@ -78,6 +74,15 @@ _COMMON_SELECT = """
     t_trade.duration            AS trade_duration
 """
 
+# Staff query has no trades join — trade_duration is always NULL
+_COMMON_SELECT_STAFF = _COMMON_SELECT.replace(
+    "t_trade.duration            AS trade_duration",
+    "NULL                        AS trade_duration",
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lesson JOINs for learners (student_access = 1 required)
+# ─────────────────────────────────────────────────────────────────────────────
 _LESSON_JOINS = """
 JOIN subjects s
     ON  s.id          = cs.subject_id
@@ -93,9 +98,23 @@ LEFT JOIN lesson_types lt
     ON  lt.id = l.lesson_type_id
 """
 
+# Lesson JOINs for staff — no access flag here; access filter is in WHERE
+_LESSON_JOINS_STAFF = """
+JOIN subjects s
+    ON  s.id          = cs.subject_id
+    AND s.status      = 1
+    AND s.deleted_at  IS NULL
+JOIN lessons l
+    ON  l.subject_id         = s.id
+    AND l.status             = 1
+    AND l.deleted_at         IS NULL
+    AND l.lesson_category_id = 'd78bc322-568f-4110-8e24-02ea444d48b7'
+LEFT JOIN lesson_types lt
+    ON  lt.id = l.lesson_type_id
+"""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # NON-PLE: centre_subject, optionally ∩ batch_subject, optionally ∩ subject_trade
-# Each intersection is applied only when the user has the corresponding data.
 # ─────────────────────────────────────────────────────────────────────────────
 _NON_PLE_SQL = """
 SELECT
@@ -147,7 +166,6 @@ ORDER BY u.id, cs.`order`, l.lesson_order
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PLE: centre_subject, optionally ∩ subject_ple_career_path, optionally ∩ batch_subject
-# Each intersection is applied only when the user has the corresponding data.
 # ─────────────────────────────────────────────────────────────────────────────
 _PLE_SQL = """
 SELECT
@@ -213,6 +231,48 @@ WHERE u.type        IN ({types})
 ORDER BY u.id, pcpu.career_path_updated_at DESC, cs.`order`, l.lesson_order
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STAFF (types 1, 2): centre_subject only
+#   Admin (type 1)           → all lessons
+#   Facilitator (type 2)     → facilitator_access = 1
+#   Master Trainer (type 2,
+#     is_master_trainer = 1) → mastertrainer_access = 1
+# ─────────────────────────────────────────────────────────────────────────────
+_STAFF_SQL = """
+SELECT
+    u.id                        AS user_id,
+    u.name                      AS user_name,
+    u.type                      AS user_type,
+    u.centre_id,
+    u.project_id,
+    NULL                        AS batch_id,
+    NULL                        AS trade_id,
+    NULL                        AS career_path_id,
+    NULL                        AS career_path_name,
+    NULL                        AS career_path_updated_at,
+    {common_select}
+
+FROM users u
+
+JOIN centre_subject cs
+    ON  cs.centre_id = u.centre_id
+
+{lesson_joins}
+
+WHERE u.type        IN (1, 2)
+  AND u.status      = 1
+  AND u.deleted_at  IS NULL
+  AND s.is_ple      IN (0, 1, 2)
+  AND (
+      u.type = 1
+      OR (u.type = 2 AND (u.is_master_trainer IS NULL OR u.is_master_trainer != 1) AND l.facilitator_access    = 1)
+      OR (u.type = 2 AND u.is_master_trainer  = 1                                  AND l.mastertrainer_access  = 1)
+  )
+  {user_clause}
+
+ORDER BY u.id, cs.`order`, l.lesson_order
+"""
+
 
 def _build(
     template:   str,
@@ -253,6 +313,36 @@ def _build(
     return sql, tuple(params) if params else None
 
 
+def _build_staff(
+    user_id:    Optional[str]       = None,
+    user_ids:   Optional[List[str]] = None,
+    centre_id:  Optional[str]       = None,
+    subject_id: Optional[str]       = None,
+) -> tuple:
+    """Build SQL + params for staff query (no batch/trade filters — not applicable)."""
+    clauses, params = [], []
+    if user_id:
+        clauses.append("AND u.id          = %s")
+        params.append(user_id)
+    elif user_ids:
+        ph = ", ".join(["%s"] * len(user_ids))
+        clauses.append(f"AND u.id          IN ({ph})")
+        params.extend(user_ids)
+    if centre_id:
+        clauses.append("AND u.centre_id   = %s")
+        params.append(centre_id)
+    if subject_id:
+        clauses.append("AND s.id          = %s")
+        params.append(subject_id)
+
+    sql = _STAFF_SQL.format(
+        common_select=_COMMON_SELECT_STAFF,
+        lesson_joins=_LESSON_JOINS_STAFF,
+        user_clause="\n  ".join(clauses),
+    )
+    return sql, tuple(params) if params else None
+
+
 def fetch_non_ple_allocation(
     user_id:    Optional[str]       = None,
     user_ids:   Optional[List[str]] = None,
@@ -262,7 +352,7 @@ def fetch_non_ple_allocation(
     trade_id:   Optional[str]       = None,
 ) -> pd.DataFrame:
     """
-    Subjects allocated to non-PLE users.
+    Subjects allocated to non-PLE learners (types 3, 4).
     centre_subject is always the base; batch_subject and subject_trade
     intersections are applied only when the user has a batch_id / trade_id.
     """
@@ -281,7 +371,7 @@ def fetch_ple_allocation(
     trade_id:   Optional[str]       = None,
 ) -> pd.DataFrame:
     """
-    Subjects allocated to PLE users.
+    Subjects allocated to PLE learners (types 3, 4, is_ple = 1).
     centre_subject is always the base; subject_ple_career_path and
     batch_subject intersections are applied only when the user has an
     active career path / batch_id respectively.
@@ -294,6 +384,26 @@ def fetch_ple_allocation(
     return df
 
 
+def fetch_staff_allocation(
+    user_id:    Optional[str]       = None,
+    user_ids:   Optional[List[str]] = None,
+    centre_id:  Optional[str]       = None,
+    subject_id: Optional[str]       = None,
+) -> pd.DataFrame:
+    """
+    Subjects allocated to staff (types 1 Admin, 2 Facilitator/Master Trainer).
+    Allocation is centre_subject only — no batch, trade, or career path filter.
+    Lesson access is filtered per user type in SQL:
+      Admin           → all lessons
+      Facilitator     → facilitator_access = 1
+      Master Trainer  → mastertrainer_access = 1
+    """
+    sql, params = _build_staff(user_id, user_ids, centre_id, subject_id)
+    df = fetch(SOURCE_DB, sql, params)
+    log.info("[s2_allocation] staff → %d rows", len(df))
+    return df
+
+
 def fetch_allocation(
     user_id:    Optional[str]       = None,
     user_ids:   Optional[List[str]] = None,
@@ -303,11 +413,12 @@ def fetch_allocation(
     trade_id:   Optional[str]       = None,
 ) -> pd.DataFrame:
     """
-    Combined allocation for all users (PLE + non-PLE), tagged with
+    Combined allocation for all users (non-PLE + PLE + staff), tagged with
     an 'allocation_path' column for traceability.
     """
     non_ple = fetch_non_ple_allocation(user_id, user_ids, centre_id, batch_id, subject_id, trade_id)
     ple     = fetch_ple_allocation(user_id, user_ids, centre_id, batch_id, subject_id, trade_id)
+    staff   = fetch_staff_allocation(user_id, user_ids, centre_id, subject_id)
 
     non_ple["allocation_path"]  = "non_ple"
     non_ple["allocation_basis"] = "centre_subject [→ batch_subject if batch] [→ subject_trade if trade]"
@@ -315,7 +426,10 @@ def fetch_allocation(
     ple["allocation_path"]      = "ple"
     ple["allocation_basis"]     = "centre_subject [→ subject_ple_career_path if career_path] [→ batch_subject if batch]"
 
-    parts    = [df for df in [non_ple, ple] if not df.empty]
+    staff["allocation_path"]    = "staff"
+    staff["allocation_basis"]   = "centre_subject (admin: all; facilitator: facilitator_access; master_trainer: mastertrainer_access)"
+
+    parts    = [df for df in [non_ple, ple, staff] if not df.empty]
     combined = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
     if combined.empty:
@@ -347,6 +461,8 @@ def fetch_allocation(
             dropped,
         )
 
-    log.info("[s2_allocation] combined → %d rows (%d non-PLE + %d PLE)",
-             len(combined), len(non_ple), len(ple))
+    log.info(
+        "[s2_allocation] combined → %d rows (%d non-PLE + %d PLE + %d staff)",
+        len(combined), len(non_ple), len(ple), len(staff),
+    )
     return combined

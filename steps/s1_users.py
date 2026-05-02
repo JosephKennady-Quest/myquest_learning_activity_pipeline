@@ -1,10 +1,13 @@
 """
-Step 1 — Fetch users (learners + alumni) with their student details.
+Step 1 — Fetch users (all active types) with their profile details.
 
 Filters applied:
-  • users.type IN (3, 4)   — learners and alumni only
-  • users.status = 1       — active accounts
+  • users.type IN (1, 2, 3, 4)  — Admin, Facilitator/Master Trainer, Learner, Alumni
+  • users.status = 1             — active accounts
   • users.deleted_at IS NULL
+
+student_details is LEFT JOINed — staff users (types 1, 2) have no row there,
+so batch_id / trade_id will be NULL for them.
 """
 
 import logging
@@ -12,7 +15,7 @@ from typing import Optional
 
 import pandas as pd
 
-from config import ANALYTICS_DB, LEARNER_TYPES_SQL, SOURCE_DB
+from config import ALL_TYPES_SQL, ANALYTICS_DB, SOURCE_DB
 from db import fetch
 
 log = logging.getLogger(__name__)
@@ -24,6 +27,7 @@ SELECT
     u.email,
     u.mobile,
     u.type                              AS user_type,
+    u.is_master_trainer,
     u.centre_id,
     u.project_id,
     u.organisation_id,
@@ -56,7 +60,8 @@ def fetch_users(
     trade_id:  Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Return all active learners/alumni with their student profile.
+    Return all active users (types 1–4) with their profile.
+    Staff users (types 1, 2) will have NULL for student_details columns.
     Optionally filter by user_id, centre_id, batch_id, and/or trade_id.
     """
     clauses, params = [], []
@@ -73,7 +78,7 @@ def fetch_users(
         clauses.append("AND sd.trade_id  = %s")
         params.append(trade_id)
 
-    sql = _SQL.format(types=LEARNER_TYPES_SQL, user_clause="\n  ".join(clauses))
+    sql = _SQL.format(types=ALL_TYPES_SQL, user_clause="\n  ".join(clauses))
     df = fetch(SOURCE_DB, sql, tuple(params) if params else None)
-    log.info("[s1_users] fetched %d users", len(df))
+    log.info("[s1_users] fetched %d users (types 1–4)", len(df))
     return df
