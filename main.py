@@ -156,19 +156,19 @@ def _make_tag(
     subject_id: str | None = None,
     trade_id:   str | None = None,
 ) -> str:
-    """Build a short filename tag from whichever filters are active."""
+    """Build a descriptive filename tag from whichever filters are active."""
     parts = []
     if user_id:
-        parts.append(f"u{user_id[:8]}")
+        parts.append(f"user_{user_id[:8]}")
     if centre_id:
-        parts.append(f"c{centre_id[:8]}")
+        parts.append(f"ctr_{centre_id[:8]}")
     if batch_id:
-        parts.append(f"b{batch_id[:8]}")
+        parts.append(f"batch_{batch_id[:8]}")
     if subject_id:
-        parts.append(f"s{subject_id[:8]}")
+        parts.append(f"subj_{subject_id[:8]}")
     if trade_id:
-        parts.append(f"t{trade_id[:8]}")
-    return "_".join(parts) if parts else "all"
+        parts.append(f"trade_{trade_id[:8]}")
+    return "_".join(parts) if parts else "all_users"
 
 
 def _save_csv(
@@ -178,7 +178,7 @@ def _save_csv(
     batch_id:   str | None = None,
     subject_id: str | None = None,
     trade_id:   str | None = None,
-    prefix:     str = "allocation",
+    prefix:     str = "lessons",
 ) -> str:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -196,7 +196,7 @@ def _save_allocation_debug(
     batch_id:   str | None = None,
     subject_id: str | None = None,
     trade_id:   str | None = None,
-    prefix:     str = "allocation_debug",
+    prefix:     str = "debug_alloc",
 ) -> None:
     """Save the raw allocation DataFrame (pre-completion) for inspection."""
     cols = [
@@ -426,7 +426,7 @@ def run(
                 _save_allocation_debug(
                     alloc.merge(counts_all, on=["user_id", "subject_id"], how="left"),
                     user_id, centre_id, batch_id, subject_id, trade_id,
-                    prefix="allocation_debug_all_types",
+                    prefix="debug_alloc_all_types",
                 )
 
         # ── Step 3: completion ────────────────────────────────────────────────
@@ -503,7 +503,7 @@ def run(
         if "subject" in active:
             if output in ("csv", "both"):
                 _save_csv(subject_agg_df, user_id, centre_id, batch_id, subject_id, trade_id,
-                          prefix="subject_agg")
+                          prefix="subjects")
             if output in ("db", "both"):
                 write_table(ANALYTICS_DB, subject_agg_df, OUTPUT_TABLE_SUBJECT, if_exists=db_write_mode)
                 log.info("DB written → %s  (chunk %d/%d, mode=%s)",
@@ -514,10 +514,10 @@ def run(
             result_all = merge_completion(alloc, compl)
             if "lesson" in active:
                 _save_csv(result_all, user_id, centre_id, batch_id, subject_id, trade_id,
-                          prefix="allocation_all_types")
+                          prefix="lessons_all_types")
             if "subject" in active:
                 _save_csv(_build_subject_agg(result_all), user_id, centre_id, batch_id,
-                          subject_id, trade_id, prefix="subject_agg_all_types")
+                          subject_id, trade_id, prefix="subjects_all_types")
 
         first_write = False
 
@@ -526,7 +526,7 @@ def run(
         no_alloc_df = pd.concat(no_alloc_rows, ignore_index=True).drop_duplicates("user_id")
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         ts            = datetime.now().strftime("%Y%m%d_%H%M%S")
-        no_alloc_path = os.path.join(OUTPUT_DIR, f"no_alloc_users_{ts}.csv")
+        no_alloc_path = os.path.join(OUTPUT_DIR, f"no_allocation_users_{ts}.csv")
         no_alloc_df.to_csv(no_alloc_path, index=False)
         log.info(
             "No-allocation users saved → %s  (%d users — had completions but no current allocation)",
