@@ -536,7 +536,7 @@ def run(
     # ── Final summary ─────────────────────────────────────────────────────────
     if summary_rows:
         if n_chunks > 1:
-            _print_summary_chunked(pd.concat(summary_rows, ignore_index=True), len(all_user_ids))
+            _print_summary_chunked(pd.concat(summary_rows, ignore_index=True), len(learner_ids) + len(staff_ids))
     else:
         log.warning("No output rows produced — check DB connections and filters.")
 
