@@ -52,7 +52,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from config import ANALYTICS_DB, ALLOC_CHUNK_SIZE, OUTPUT_DIR
+from config import ANALYTICS_DB, ALLOC_CHUNK_SIZE, STAFF_ALLOC_CHUNK_SIZE, OUTPUT_DIR
 from db import delete_user_rows, write_table
 from steps.s0_changed_users import fetch_changed_user_ids
 from steps.s1_users import fetch_users
@@ -360,20 +360,28 @@ def run(
             return pd.DataFrame()
         log.info("Scoped to %d users matching both filters and new-completion list", len(users_df))
 
-    all_user_ids = users_df["user_id"].dropna().tolist()
+    # ── Separate learners (3,4) from staff (1,2) for independent chunking.
+    # Staff (especially Admin) return many more rows per user, so they use a
+    # smaller chunk size and only run the staff allocation path — not non_ple/ple.
+    # Learner chunks only run non_ple + ple — the staff query is never called
+    # for learner-only chunks, restoring the original 2-queries-per-chunk cadence.
+    learner_ids = users_df.loc[users_df["user_type"].isin([3, 4]), "user_id"].dropna().tolist()
+    staff_ids   = users_df.loc[users_df["user_type"].isin([1, 2]), "user_id"].dropna().tolist()
 
-    # ── Chunk the user list to avoid loading all allocation data at once.
-    # Each chunk is processed end-to-end (allocation → completion → merge → write).
-    # DB writes use "replace" on the first chunk and "append" on subsequent ones.
-    chunks   = [all_user_ids[i:i + ALLOC_CHUNK_SIZE]
-                for i in range(0, len(all_user_ids), ALLOC_CHUNK_SIZE)]
-    n_chunks = len(chunks)
+    learner_chunks = [learner_ids[i:i + ALLOC_CHUNK_SIZE]
+                      for i in range(0, len(learner_ids), ALLOC_CHUNK_SIZE)]
+    staff_chunks   = [staff_ids[i:i + STAFF_ALLOC_CHUNK_SIZE]
+                      for i in range(0, len(staff_ids), STAFF_ALLOC_CHUNK_SIZE)]
 
-    if n_chunks > 1:
-        log.info(
-            "Large run: %d users → %d chunks of up to %d each",
-            len(all_user_ids), n_chunks, ALLOC_CHUNK_SIZE,
-        )
+    all_chunks = [(c, "learner") for c in learner_chunks] + [(c, "staff") for c in staff_chunks]
+    n_chunks   = len(all_chunks)
+
+    log.info(
+        "Users: %d learners (%d chunks) + %d staff (%d chunks) = %d chunks total",
+        len(learner_ids), len(learner_chunks),
+        len(staff_ids),   len(staff_chunks),
+        n_chunks,
+    )
 
     first_write    = True           # replace on first chunk, append on the rest
     summary_rows   = []             # accumulates one row per user for final report
@@ -383,15 +391,20 @@ def run(
         "centre_id", "project_id", "is_ple", "batch_id", "trade_id",
     ] if c in users_df.columns]
 
-    for chunk_idx, chunk_ids in enumerate(chunks, 1):
+    for chunk_idx, (chunk_ids, chunk_type) in enumerate(all_chunks, 1):
         if n_chunks > 1:
-            log.info("─── Chunk %d / %d  (%d users) ───", chunk_idx, n_chunks, len(chunk_ids))
+            log.info("─── Chunk %d / %d  (%d %s users) ───",
+                     chunk_idx, n_chunks, len(chunk_ids), chunk_type)
 
         # ── Step 2: allocation for this chunk ────────────────────────────────
+        # Learner chunks: only non_ple + ple (2 queries, same as original).
+        # Staff chunks: only staff path (1 query, avoids large learner queries).
+        alloc_paths = ("non_ple", "ple") if chunk_type == "learner" else ("staff",)
         alloc = fetch_allocation(
             user_ids=chunk_ids,
             centre_id=centre_id, batch_id=batch_id,
             subject_id=subject_id, trade_id=trade_id,
+            paths=alloc_paths,
         )
         alloc_filtered = _apply_lesson_type_filter(alloc) if not alloc.empty else alloc
 

@@ -139,11 +139,13 @@ JOIN centre_subject cs
     ON  cs.centre_id = u.centre_id
 
 LEFT JOIN batch_subject bs
-    ON  bs.batch_id   = sd.batch_id
+    ON  sd.batch_id   IS NOT NULL
+    AND bs.batch_id   = sd.batch_id
     AND bs.subject_id = cs.subject_id
 
 LEFT JOIN subject_trade st
-    ON  st.trade_id   = sd.trade_id
+    ON  sd.trade_id   IS NOT NULL
+    AND st.trade_id   = sd.trade_id
     AND st.subject_id = cs.subject_id
 
 LEFT JOIN trades t_trade
@@ -206,11 +208,13 @@ JOIN centre_subject cs
     ON  cs.centre_id    = u.centre_id
 
 LEFT JOIN subject_ple_career_path spcp
-    ON  spcp.ple_career_path_id = pcp.id
+    ON  pcp.id        IS NOT NULL
+    AND spcp.ple_career_path_id = pcp.id
     AND spcp.subject_id          = cs.subject_id
 
 LEFT JOIN batch_subject bs
-    ON  bs.batch_id   = sd.batch_id
+    ON  sd.batch_id   IS NOT NULL
+    AND bs.batch_id   = sd.batch_id
     AND bs.subject_id = cs.subject_id
 
 LEFT JOIN trades t_trade
@@ -435,25 +439,37 @@ def fetch_allocation(
     batch_id:   Optional[str]       = None,
     subject_id: Optional[str]       = None,
     trade_id:   Optional[str]       = None,
+    paths:      tuple               = ("non_ple", "ple", "staff"),
 ) -> pd.DataFrame:
     """
-    Combined allocation for all users (non-PLE + PLE + staff), tagged with
-    an 'allocation_path' column for traceability.
+    Combined allocation for users, tagged with 'allocation_path' for traceability.
+
+    paths: restrict which allocation paths are executed — useful to avoid
+    running irrelevant queries when the caller already knows the chunk
+    contains only learners ("non_ple","ple") or only staff ("staff").
+    Default is all three paths.
     """
-    non_ple = fetch_non_ple_allocation(user_id, user_ids, centre_id, batch_id, subject_id, trade_id)
-    ple     = fetch_ple_allocation(user_id, user_ids, centre_id, batch_id, subject_id, trade_id)
-    staff   = fetch_staff_allocation(user_id, user_ids, centre_id, subject_id)
+    frames = []
 
-    non_ple["allocation_path"]  = "non_ple"
-    non_ple["allocation_basis"] = "centre_subject [→ batch_subject if batch] [→ subject_trade if trade]"
+    if "non_ple" in paths:
+        non_ple = fetch_non_ple_allocation(user_id, user_ids, centre_id, batch_id, subject_id, trade_id)
+        non_ple["allocation_path"]  = "non_ple"
+        non_ple["allocation_basis"] = "centre_subject [→ batch_subject if batch] [→ subject_trade if trade]"
+        frames.append(non_ple)
 
-    ple["allocation_path"]      = "ple"
-    ple["allocation_basis"]     = "centre_subject [→ subject_ple_career_path if career_path] [→ batch_subject if batch]"
+    if "ple" in paths:
+        ple = fetch_ple_allocation(user_id, user_ids, centre_id, batch_id, subject_id, trade_id)
+        ple["allocation_path"]      = "ple"
+        ple["allocation_basis"]     = "centre_subject [→ subject_ple_career_path if career_path] [→ batch_subject if batch]"
+        frames.append(ple)
 
-    staff["allocation_path"]    = "staff"
-    staff["allocation_basis"]   = "centre_subject (admin: all; facilitator: facilitator_access; master_trainer: mastertrainer_access)"
+    if "staff" in paths:
+        staff = fetch_staff_allocation(user_id, user_ids, centre_id, subject_id)
+        staff["allocation_path"]    = "staff"
+        staff["allocation_basis"]   = "centre_subject (admin: all; facilitator: facilitator_access; master_trainer: mastertrainer_access)"
+        frames.append(staff)
 
-    combined = _concat([non_ple, ple, staff])
+    combined = _concat(frames)
 
     if combined.empty:
         log.info("[s2_allocation] combined → 0 rows (no allocation found for this filter)")
@@ -484,8 +500,5 @@ def fetch_allocation(
             dropped,
         )
 
-    log.info(
-        "[s2_allocation] combined → %d rows (%d non-PLE + %d PLE + %d staff)",
-        len(combined), len(non_ple), len(ple), len(staff),
-    )
+    log.info("[s2_allocation] combined → %d rows  paths=%s", len(combined), paths)
     return combined

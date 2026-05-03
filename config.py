@@ -46,8 +46,9 @@ SOURCE_DB    = CONFIG["source"]
 ANALYTICS_DB = CONFIG["destination"]
 
 # ── Pipeline constants ────────────────────────────────────────────────────────
-CHUNK_SIZE        = 5000    # DB insert batch size (rows per executemany call)
-ALLOC_CHUNK_SIZE  = 2000    # users per allocation query (prevents OOM on full runs)
+CHUNK_SIZE             = 5000   # DB insert batch size (rows per executemany call)
+ALLOC_CHUNK_SIZE       = 2000   # learner users per allocation query (prevents OOM on full runs)
+STAFF_ALLOC_CHUNK_SIZE = 200    # staff per allocation query (admins get many more rows)
 LEARNER_TYPES     = (3, 4)
 LEARNER_TYPES_SQL = ",".join(str(t) for t in LEARNER_TYPES)
 
