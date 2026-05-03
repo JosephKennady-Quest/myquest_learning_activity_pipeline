@@ -274,6 +274,30 @@ ORDER BY u.id, cs.`order`, l.lesson_order
 """
 
 
+def _concat(frames: list) -> pd.DataFrame:
+    """
+    Concat non-empty DataFrames, casting all-NA columns to object dtype first.
+
+    Columns that are NULL in one path but populated in another (e.g.
+    career_path_id in non_ple, batch_id in staff) trigger a FutureWarning
+    in pandas if their dtype is inferred from the all-NA frame. Casting to
+    object before concat makes the dtype explicit and silences the warning.
+    """
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return pd.DataFrame()
+    if len(frames) == 1:
+        return frames[0].reset_index(drop=True)
+    fixed = []
+    for df in frames:
+        df = df.copy()
+        for col in df.columns:
+            if df[col].isna().all():
+                df[col] = df[col].astype(object)
+        fixed.append(df)
+    return pd.concat(fixed, ignore_index=True)
+
+
 def _build(
     template:   str,
     user_id:    Optional[str]       = None,
@@ -429,8 +453,7 @@ def fetch_allocation(
     staff["allocation_path"]    = "staff"
     staff["allocation_basis"]   = "centre_subject (admin: all; facilitator: facilitator_access; master_trainer: mastertrainer_access)"
 
-    parts    = [df for df in [non_ple, ple, staff] if not df.empty]
-    combined = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    combined = _concat([non_ple, ple, staff])
 
     if combined.empty:
         log.info("[s2_allocation] combined → 0 rows (no allocation found for this filter)")
