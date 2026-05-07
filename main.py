@@ -42,6 +42,7 @@ completed = 0, total_completed = 0, completion_pct = 0.0.
 """
 
 import argparse
+import gc
 import gzip
 import logging
 import logging.handlers
@@ -94,9 +95,11 @@ def _setup_file_logging(log_path: str) -> None:
     logging.getLogger().addHandler(handler)
 
 # Lesson-level detail table (one row per user × completed lesson)
-OUTPUT_TABLE_LESSON   = "main_learning_activity_myquest_ael_lesson"
-# Subject-level aggregation table (one row per user × subject) — primary output
-OUTPUT_TABLE_SUBJECT  = "main_learning_activity_myquest_ael"
+OUTPUT_TABLE_LESSON      = "main_learning_activity_myquest_ael_lesson"
+# Subject-level aggregation — filtered (excludes pdf/mp4/pdf web lessons)
+OUTPUT_TABLE_SUBJECT     = "main_learning_activity_myquest_ael"
+# Subject-level aggregation — all lesson types (includes pdf/mp4/pdf web)
+OUTPUT_TABLE_SUBJECT_ALL = "main_learning_activity_myquest_ael_all_lesson_type"
 
 # Lesson types excluded from the default output (pdf/mp4/pdf web are non-interactive content)
 _EXCLUDED_LESSON_TYPES = {"pdf", "mp4", "pdf web"}
@@ -136,6 +139,17 @@ def parse_args():
         ),
     )
     p.add_argument("--dry-run", action="store_true", help="Print row counts only, no output written")
+    p.add_argument(
+        "--start-chunk",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Resume a killed run from chunk N (1-based). Skips chunks 1..N-1 and appends "
+            "rather than replacing, so already-written chunks are preserved. "
+            "Example: --start-chunk 65  (resume after kill at chunk 64)"
+        ),
+    )
     p.add_argument(
         "--log-file",
         default=None,
@@ -317,6 +331,7 @@ def run(
     dry_run:          bool = False,
     outputs:          str = "lesson,subject,debug",
     all_lesson_types: bool = False,
+    start_chunk:      int = 1,
 ) -> pd.DataFrame:
     active = {o.strip().lower() for o in outputs.split(",")}
     mode   = f"incremental (since={since})" if since else "full refresh"
@@ -383,22 +398,40 @@ def run(
         n_chunks,
     )
 
-    first_write    = True           # replace on first chunk, append on the rest
-    summary_rows   = []             # accumulates one row per user for final report
-    no_alloc_rows  = []             # accumulates no-allocation users across all chunks
+    # Small run = each user type fits in one chunk. Used to gate debug CSV.
+    is_small_run = (len(learner_chunks) <= 1 and len(staff_chunks) <= 1)
+
+    if start_chunk > 1:
+        log.info("Resuming from chunk %d — chunks 1..%d already written; appending only.",
+                 start_chunk, start_chunk - 1)
+
+    # When resuming, treat every write as append (don't truncate already-written data).
+    first_write     = (start_chunk == 1)
+    first_all_write = (start_chunk == 1)
+
+    summary_rows  = []   # lightweight per-user rows for final summary
+    no_alloc_rows = []   # no-allocation users accumulated across chunks
+
+    # For --all-lesson-types CSV on small runs: accumulate subject-level frames only
+    # (subject agg is ~24K rows/chunk — manageable). Large runs skip the CSV.
+    all_type_subj_frames: list = [] if (all_lesson_types and is_small_run) else None
     _no_alloc_keep = [c for c in [
         "user_id", "user_name", "user_type", "is_master_trainer",
         "centre_id", "project_id", "is_ple", "batch_id", "trade_id",
     ] if c in users_df.columns]
 
     for chunk_idx, (chunk_ids, chunk_type) in enumerate(all_chunks, 1):
+        # ── Resume: skip already-processed chunks ─────────────────────────────
+        if chunk_idx < start_chunk:
+            if chunk_idx % 50 == 0 or chunk_idx == start_chunk - 1:
+                log.info("Skipping chunk %d / %d (already written)", chunk_idx, n_chunks)
+            continue
+
         if n_chunks > 1:
             log.info("─── Chunk %d / %d  (%d %s users) ───",
                      chunk_idx, n_chunks, len(chunk_ids), chunk_type)
 
         # ── Step 2: allocation for this chunk ────────────────────────────────
-        # Learner chunks: only non_ple + ple (2 queries, same as original).
-        # Staff chunks: only staff path (1 query, avoids large learner queries).
         alloc_paths = ("non_ple", "ple") if chunk_type == "learner" else ("staff",)
         alloc = fetch_allocation(
             user_ids=chunk_ids,
@@ -414,8 +447,8 @@ def run(
                 len(alloc), len(alloc_filtered), len(alloc) - len(alloc_filtered),
             )
 
-        # Debug CSV — only for single-chunk runs (too large for full runs)
-        if "debug" in active and not dry_run and n_chunks == 1 and not alloc_filtered.empty:
+        # Debug CSV — only for small (single-chunk) runs and when CSV output is requested
+        if "debug" in active and not dry_run and output in ("csv", "both") and is_small_run and not alloc_filtered.empty:
             counts = _compute_subj_alloc_counts(alloc_filtered)
             _save_allocation_debug(
                 alloc_filtered.merge(counts, on=["user_id", "subject_id"], how="left"),
@@ -436,11 +469,21 @@ def run(
             log.info("Fetching completion for %d allocated users", len(a_ids))
             compl  = fetch_completion(user_ids=a_ids, user_types=u_types)
             result = merge_completion(alloc_filtered, compl)
+            if all_lesson_types:
+                # Compute all-types output only when explicitly requested.
+                # Reuse completion data, so this adds no extra DB read.
+                result_all  = merge_completion(alloc, compl)
+                subj_all_df = _build_subject_agg(result_all)
+                del result_all   # free lesson-level all-types immediately
+            else:
+                subj_all_df = pd.DataFrame()
         else:
-            result = pd.DataFrame()
+            compl       = None
+            result      = pd.DataFrame()
+            subj_all_df = pd.DataFrame()
 
         # ── Add stubs for users in this chunk with no allocation ──────────────
-        result_uids = set(result["user_id"].dropna().unique()) if not result.empty else set()
+        result_uids  = set(result["user_id"].dropna().unique()) if not result.empty else set()
         no_alloc_ids = set(chunk_ids) - result_uids
         if no_alloc_ids:
             stub = (
@@ -461,6 +504,8 @@ def run(
             no_alloc_rows.append(stub[_no_alloc_keep].copy())
 
         if result.empty:
+            del alloc, alloc_filtered
+            gc.collect()
             continue
 
         # Accumulate lightweight per-user summary (3 cols × n_users — stays small)
@@ -475,26 +520,31 @@ def run(
             _print_summary(result)
 
         if dry_run:
+            del alloc, alloc_filtered, result, subj_all_df
+            gc.collect()
             continue
 
         # ── Write outputs ─────────────────────────────────────────────────────
-        # Full refresh  → replace (TRUNCATE) on first chunk, append on the rest.
-        # Incremental   → delete this chunk's user rows then append, so existing
-        #                 rows for untouched users are never disturbed.
+        # Full refresh  → replace on first chunk, append on the rest.
+        # Incremental   → delete this chunk's user rows then append.
         subject_agg_df = _build_subject_agg(result)
 
         if output in ("db", "both"):
             if since:
-                # Incremental: remove stale rows for this chunk's users, then insert
-                delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_LESSON,  chunk_ids)
-                delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_SUBJECT, chunk_ids)
-                db_write_mode = "append"
+                delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_LESSON,     chunk_ids)
+                delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_SUBJECT,     chunk_ids)
+                if all_lesson_types:
+                    delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_SUBJECT_ALL, chunk_ids)
+                db_write_mode     = "append"
+                db_write_mode_all = "append"
             else:
-                db_write_mode = "replace" if first_write else "append"
+                db_write_mode     = "replace" if first_write     else "append"
+                db_write_mode_all = "replace" if first_all_write else "append"
 
         if "lesson" in active:
             if output in ("csv", "both"):
-                _save_csv(result, user_id, centre_id, batch_id, subject_id, trade_id)
+                _save_csv(result, user_id, centre_id, batch_id, subject_id, trade_id,
+                          prefix="lessons_filtered")
             if output in ("db", "both"):
                 write_table(ANALYTICS_DB, result, OUTPUT_TABLE_LESSON, if_exists=db_write_mode)
                 log.info("DB written → %s  (chunk %d/%d, mode=%s)",
@@ -503,26 +553,48 @@ def run(
         if "subject" in active:
             if output in ("csv", "both"):
                 _save_csv(subject_agg_df, user_id, centre_id, batch_id, subject_id, trade_id,
-                          prefix="subjects")
+                          prefix="subjects_filtered")
             if output in ("db", "both"):
-                write_table(ANALYTICS_DB, subject_agg_df, OUTPUT_TABLE_SUBJECT, if_exists=db_write_mode)
+                write_table(ANALYTICS_DB, subject_agg_df, OUTPUT_TABLE_SUBJECT,
+                            if_exists=db_write_mode)
                 log.info("DB written → %s  (chunk %d/%d, mode=%s)",
                          OUTPUT_TABLE_SUBJECT, chunk_idx, n_chunks, db_write_mode)
 
-        # All-lesson-types variants (CSV only, single-chunk runs)
-        if all_lesson_types and n_chunks == 1 and output in ("csv", "both"):
-            result_all = merge_completion(alloc, compl)
-            if "lesson" in active:
-                _save_csv(result_all, user_id, centre_id, batch_id, subject_id, trade_id,
-                          prefix="lessons_all_types")
+            # All-lesson-types subject table — written only when requested.
+            if all_lesson_types and output in ("db", "both") and not subj_all_df.empty:
+                write_table(ANALYTICS_DB, subj_all_df, OUTPUT_TABLE_SUBJECT_ALL,
+                            if_exists=db_write_mode_all)
+                log.info("DB written → %s  (chunk %d/%d, mode=%s)",
+                         OUTPUT_TABLE_SUBJECT_ALL, chunk_idx, n_chunks, db_write_mode_all)
+
+            # Accumulate all-types subject rows for CSV on small runs only
+            if all_type_subj_frames is not None and not subj_all_df.empty:
+                all_type_subj_frames.append(subj_all_df.copy())
+
+        first_write     = False
+        first_all_write = False
+
+        # ── Release memory before next chunk ─────────────────────────────────
+        del alloc, alloc_filtered, compl, result, subject_agg_df, subj_all_df
+        gc.collect()
+
+    # ── All-lesson-types CSV (small runs only) ────────────────────────────────
+    if all_lesson_types and not dry_run and output in ("csv", "both"):
+        if all_type_subj_frames:
+            combined_all = pd.concat(all_type_subj_frames, ignore_index=True)
             if "subject" in active:
-                _save_csv(_build_subject_agg(result_all), user_id, centre_id, batch_id,
+                _save_csv(combined_all, user_id, centre_id, batch_id,
                           subject_id, trade_id, prefix="subjects_all_types")
+            del combined_all
+        elif not is_small_run:
+            log.info(
+                "Skipping all-types CSV for large run (%d chunks) — "
+                "rerun with narrower filters if an all-types CSV is required.",
+                n_chunks,
+            )
 
-        first_write = False
-
-    # ── Save no-allocation user list ──────────────────────────────────────────
-    if no_alloc_rows and not dry_run:
+    # ── Save no-allocation user list (CSV only) ───────────────────────────────
+    if no_alloc_rows and not dry_run and output in ("csv", "both"):
         no_alloc_df = pd.concat(no_alloc_rows, ignore_index=True).drop_duplicates("user_id")
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         ts            = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -563,5 +635,6 @@ if __name__ == "__main__":
         dry_run=args.dry_run,
         outputs=args.outputs,
         all_lesson_types=args.all_lesson_types,
+        start_chunk=args.start_chunk,
     )
     sys.exit(0 if not df.empty else 1)

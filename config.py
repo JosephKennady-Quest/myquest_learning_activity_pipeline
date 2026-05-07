@@ -47,8 +47,8 @@ ANALYTICS_DB = CONFIG["destination"]
 
 # ── Pipeline constants ────────────────────────────────────────────────────────
 CHUNK_SIZE             = 5000   # DB insert batch size (rows per executemany call)
-ALLOC_CHUNK_SIZE       = 2000   # learner users per allocation query (prevents OOM on full runs)
-STAFF_ALLOC_CHUNK_SIZE = 200    # staff per allocation query (admins get many more rows)
+ALLOC_CHUNK_SIZE       = 500    # learner users per allocation query; keeps allocation DataFrames below OOM-prone sizes
+STAFF_ALLOC_CHUNK_SIZE = 100    # staff users per allocation query; admins can expand to all centre lessons
 LEARNER_TYPES     = (3, 4)
 LEARNER_TYPES_SQL = ",".join(str(t) for t in LEARNER_TYPES)
 
