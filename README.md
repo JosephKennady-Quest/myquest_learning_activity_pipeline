@@ -950,6 +950,41 @@ Each `fetch()` or `write_table()` call opens and closes its own tunnel. No persi
 
 ---
 
+## Handling Allocation Changes
+
+The incremental mode (`--since`) only detects users with **new completions**. It does not detect changes to allocation structure (subjects/lessons added or removed). When allocation changes, stale rows remain in the DB for users who haven't completed anything since the change.
+
+### When allocation changes — what to do
+
+| Change type | Action |
+|---|---|
+| Subject / lessons added to a centre | `python main.py --centre-id <uuid> --output db` |
+| Subject / lessons removed from a centre | `python main.py --centre-id <uuid> --output db` |
+| Batch allocation changed | `python main.py --batch-id <uuid> --output db` |
+| Trade allocation changed | `python main.py --trade-id <uuid> --output db` |
+| Large structural change (many centres) | Full refresh: `python main.py --output db` |
+
+A scoped refresh by `--centre-id` / `--batch-id` / `--trade-id` recalculates and replaces rows only for users in that scope. It is much faster than a full refresh and surgically correct.
+
+> **Rule of thumb:** whenever the admin panel is used to add or remove subjects/lessons from a centre, batch, or trade — run the corresponding scoped refresh immediately afterward.
+
+### Why incremental mode doesn't catch this
+
+`--since` queries `learning_activities.completed_at` to find changed users. Allocation tables (`centre_subject`, `batch_subject`, `subject_trade`, `subject_ple_career_path`) have no corresponding event in the activity log — the pipeline has no way to know they changed unless told explicitly.
+
+### Recommended schedule
+
+```cron
+# Daily incremental — picks up new completions (fast, ~minutes)
+5 0 * * * cd /path/to/ael_v2_pipeline && venv/bin/python main.py \
+  --since "$(date -d 'yesterday' '+%Y-%m-%d 00:00:00')" --log-file /var/log/ael.log
+
+# Monthly full refresh — catches any allocation drift (slow, ~5h)
+0 1 1 * * cd /path/to/ael_v2_pipeline && venv/bin/python main.py --log-file /var/log/ael_full.log
+```
+
+---
+
 ## Troubleshooting
 
 **Only two DB tables appear after running**

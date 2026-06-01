@@ -436,12 +436,43 @@ Both files are written only when `"debug"` is in `--outputs` (default).
 
 ---
 
+## Allocation Changes vs Incremental Mode — Known Limitation
+
+### The problem
+
+`--since` (incremental mode) only catches users with new **completions** (queries `learning_activities.completed_at`). It does NOT detect changes to allocation structure:
+
+- New subject added to `centre_subject` → users' `total_allocated` stays stale
+- Lesson removed from a subject → stale lesson rows remain in the DB
+- Batch / trade / career path mapping changed → affected users not reprocessed
+
+Users who haven't completed anything since the allocation change are silently skipped.
+
+### Current recommended fix (no code change required)
+
+Whenever allocation changes in the admin panel, run a scoped full refresh for the affected scope:
+
+```bash
+python main.py --centre-id <uuid> --output db    # allocation changed for a centre
+python main.py --batch-id <uuid> --output db     # allocation changed for a batch
+python main.py --trade-id <uuid> --output db     # allocation changed for a trade
+```
+
+This uses `db_write_mode = "replace"` on first chunk, correctly overwriting stale rows for all users in that scope.
+
+### Future improvement (Solution 2)
+
+If `centre_subject`, `batch_subject`, `subject_trade`, and `subject_ple_career_path` tables gain `updated_at`/`deleted_at` columns, a new `fetch_allocation_changed_user_ids(since)` function in `s0_changed_users.py` could detect affected users automatically and union them into `changed_ids`. This would make incremental mode fully self-correcting without any manual intervention.
+
+---
+
 ## Possible Next Steps
 
-1. **Scheduling / automation** — cron daily incremental + monthly full refresh
+1. **Scheduling / automation** — cron daily incremental + monthly full refresh (see README → Handling Allocation Changes)
 2. **Full run validation** — compare total row counts against old Talend output
 3. **Error alerting** — email/Slack notification on pipeline failure or zero-row output
 4. **Incremental for all-lesson-types table** — currently uses `replace` mode (full rebuild) even on incremental runs; could be improved to DELETE + INSERT per changed user
+5. **Allocation change detection (Solution 2)** — if allocation tables get `updated_at`, extend `s0_changed_users.py` to auto-detect affected users and include them in incremental runs
 
 ---
 
