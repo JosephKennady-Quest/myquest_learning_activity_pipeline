@@ -35,6 +35,7 @@ Use --force-refresh to bypass both layers and rebuild from scratch.
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 import duckdb
@@ -346,6 +347,43 @@ class TableCache:
                     df[col] = df[col].where(~mask, None)
         return df
 
+    @staticmethod
+    def _fetch_with_retry(sql: str, params, max_retries: int = 3, base_wait: float = 5.0) -> pd.DataFrame:
+        """
+        Wrap db.fetch() with retry logic for lost-connection errors.
+
+        MySQL drops long-running connections due to wait_timeout or net_read_timeout.
+        Each batch in refresh_completion_tables() opens its own SSH tunnel, so a
+        lost connection on one batch doesn't affect the others — we just retry.
+
+        Retries: up to max_retries attempts with exponential backoff
+          attempt 1 failure → wait 5s  → retry
+          attempt 2 failure → wait 10s → retry
+          attempt 3 failure → wait 20s → retry
+          attempt 4 failure → raise
+        """
+        last_exc = None
+        for attempt in range(1, max_retries + 2):
+            try:
+                return fetch(SOURCE_DB, sql, params)
+            except Exception as exc:
+                last_exc = exc
+                err_msg  = str(exc).lower()
+                is_conn  = any(k in err_msg for k in (
+                    "lost connection", "server has gone away",
+                    "broken pipe", "connection reset", "timed out",
+                    "can't connect", "connection refused",
+                ))
+                if not is_conn or attempt > max_retries:
+                    raise
+                wait = base_wait * (2 ** (attempt - 1))
+                log.warning(
+                    "[table_cache] Lost connection on attempt %d/%d — retrying in %.0fs  (%s)",
+                    attempt, max_retries, wait, exc,
+                )
+                time.sleep(wait)
+        raise last_exc  # unreachable but satisfies linters
+
     def refresh(self):
         """Fetch all source tables from production and store in DuckDB."""
         col_w = max(len(t) for t in SOURCE_CACHE_TABLES) + 2
@@ -355,7 +393,7 @@ class TableCache:
 
         for table in SOURCE_CACHE_TABLES:
             try:
-                df = self._sanitize(fetch(SOURCE_DB, f"SELECT * FROM {table}", None))
+                df = self._sanitize(self._fetch_with_retry(f"SELECT * FROM {table}", None))
                 self._con.execute(f"DROP TABLE IF EXISTS {table}")
                 self._con.register("_tmp", df)
                 self._con.execute(f"CREATE TABLE {table} AS SELECT * FROM _tmp")
@@ -516,7 +554,7 @@ class TableCache:
 
     # ── Public refresh method ─────────────────────────────────────────────────
 
-    def refresh_completion_tables(self, batch_size: int = 5000, incremental: bool = True):
+    def refresh_completion_tables(self, batch_size: int = 2000, incremental: bool = True):
         """
         Cache learning_activities and facilitator_learning_activities in DuckDB.
 
@@ -556,7 +594,7 @@ class TableCache:
                     log.info("[table_cache]   last cached completed_at : %s", last_ts)
                     log.info("[table_cache]   fetching records newer than that ...")
 
-                    df = self._sanitize(fetch(SOURCE_DB, incr_sql, (last_ts,)))
+                    df = self._sanitize(self._fetch_with_retry(incr_sql, (last_ts,)))
 
                     if df.empty:
                         log.info(
@@ -617,7 +655,7 @@ class TableCache:
                 for i, chunk in enumerate(chunks, 1):
                     placeholders = ", ".join(["%s"] * len(chunk))
                     sql = batch_sql.format(placeholders=placeholders)
-                    df  = self._sanitize(fetch(SOURCE_DB, sql, tuple(chunk)))
+                    df  = self._sanitize(self._fetch_with_retry(sql, tuple(chunk)))
 
                     if not df.empty:
                         self._con.register("_tmp", df)
