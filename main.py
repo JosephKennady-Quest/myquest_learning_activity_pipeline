@@ -399,9 +399,10 @@ def run(
         else:
             tbl.log_status()
 
-        # Refresh completion tables every run (live data — always re-fetched).
-        # After this, all three steps (s1, s2, s3) query DuckDB instead of MySQL.
-        tbl.refresh_completion_tables()
+        # Refresh completion tables every run (live data).
+        # incremental=True (default): appends only rows newer than last run.
+        # incremental=False (--force-refresh): drops and rebuilds from scratch.
+        tbl.refresh_completion_tables(incremental=not force_refresh)
 
         fetch_fn = tbl.make_fetch_fn()
         log.info("[table_cache] s1 + s2 + s3 will all query DuckDB cache this run")

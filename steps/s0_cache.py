@@ -339,9 +339,7 @@ class TableCache:
         except Exception as exc:
             log.warning("[table_cache] Could not read cache status: %s", exc)
 
-    # Batch SQL for completion tables.
-    # user_ids are passed as %s placeholders (one batch at a time).
-    # lesson_id filter runs as a subquery on production — small tables, fast.
+    # ── Full-refresh batch SQL (user_id chunks) ───────────────────────────────
     _LA_BATCH_SQL = """
         SELECT la.*
         FROM learning_activities la
@@ -374,30 +372,168 @@ class TableCache:
           )
     """
 
-    def refresh_completion_tables(self, batch_size: int = 5000):
+    # ── Incremental SQL (completed_at > last cached timestamp) ────────────────
+    # Fetches all new/updated completed records since last run — no user_id
+    # batching needed since the timestamp filter keeps the result set small.
+    _LA_INCR_SQL = """
+        SELECT la.*
+        FROM learning_activities la
+        WHERE la.completed    = 1
+          AND la.completed_at > %s
+          AND la.user_id IN (
+              SELECT id FROM users
+              WHERE status = 1 AND deleted_at IS NULL AND type IN (3, 4)
+          )
+          AND la.lesson_id IN (
+              SELECT DISTINCT l.id
+              FROM centre_subject cs
+              LEFT JOIN lessons  l ON l.subject_id = cs.subject_id
+              LEFT JOIN subjects s ON s.id = cs.subject_id
+              WHERE l.id IS NOT NULL
+                AND s.status = 1 AND s.deleted_at IS NULL
+                AND l.status = 1 AND l.deleted_at IS NULL
+          )
+    """
+
+    _FLA_INCR_SQL = """
+        SELECT fla.*
+        FROM facilitator_learning_activities fla
+        WHERE fla.completed    = 1
+          AND fla.completed_at > %s
+          AND fla.user_id IN (
+              SELECT id FROM users
+              WHERE status = 1 AND deleted_at IS NULL AND type IN (1, 2)
+          )
+          AND fla.lesson_id IN (
+              SELECT DISTINCT l.id
+              FROM centre_subject cs
+              LEFT JOIN lessons  l ON l.subject_id = cs.subject_id
+              LEFT JOIN subjects s ON s.id = cs.subject_id
+              WHERE l.id IS NOT NULL
+                AND s.status = 1 AND s.deleted_at IS NULL
+                AND l.status = 1 AND l.deleted_at IS NULL
+          )
+    """
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _get_last_completion_ts(self, table: str) -> str | None:
+        """Return the stored MAX(completed_at) for a completion table, or None."""
+        try:
+            row = self._con.execute(
+                "SELECT str_value FROM cache_meta WHERE key = ?",
+                [f"{table}_max_completed_at"],
+            ).fetchone()
+            return row[0] if row and row[0] else None
+        except Exception:
+            return None
+
+    def _save_last_completion_ts(self, table: str, ts: str):
+        """Persist MAX(completed_at) after a full or incremental cache run."""
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        self._con.execute(
+            """
+            INSERT INTO cache_meta (key, int_value, str_value, updated_at)
+            VALUES (?, NULL, ?, ?)
+            ON CONFLICT (key) DO UPDATE SET
+                str_value  = excluded.str_value,
+                updated_at = excluded.updated_at
+            """,
+            [f"{table}_max_completed_at", str(ts), now],
+        )
+
+    def _upsert_source_meta(self, table: str, row_count: int):
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        self._con.execute(
+            """
+            INSERT INTO source_table_meta (table_name, row_count, cached_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT (table_name) DO UPDATE SET
+                row_count = excluded.row_count,
+                cached_at = excluded.cached_at
+            """,
+            [table, row_count, now],
+        )
+
+    # ── Public refresh method ─────────────────────────────────────────────────
+
+    def refresh_completion_tables(self, batch_size: int = 5000, incremental: bool = True):
         """
-        Fetch learning_activities and facilitator_learning_activities from
-        production in user_id batches and store in DuckDB.
+        Cache learning_activities and facilitator_learning_activities in DuckDB.
 
-        Batching avoids large single queries that can timeout or exhaust
-        memory on the server.  User IDs are read from the already-cached
-        users table in DuckDB — no extra production query needed.
+        Incremental mode (default, incremental=True):
+          Checks whether a MAX(completed_at) snapshot exists for each table.
+          If yes → fetches only rows WHERE completed_at > last_ts and appends.
+          If no  → falls back to full batch refresh automatically.
 
-        Filters applied per batch:
-          • completed = 1 only
-          • lesson_id must be an active lesson in centre_subject
+          The s3_completion SQL already uses MAX(score)/SUM(duration) with
+          GROUP BY (user_id, lesson_id), so appended duplicate keys are
+          handled correctly by aggregation at query time.
+
+        Full mode (incremental=False, used with --force-refresh):
+          Drops and rebuilds each table from scratch in user_id batches.
+
+        batch_size controls how many user_ids are fetched per production
+        query during full refresh. Has no effect in incremental mode.
         """
         col_w = len("facilitator_learning_activities") + 2
-        log.info("[table_cache] ── Caching completion tables (batched) ───────────────")
-
         specs = [
-            ("learning_activities",             "3, 4", self._LA_BATCH_SQL),
-            ("facilitator_learning_activities", "1, 2", self._FLA_BATCH_SQL),
+            ("learning_activities",             "3, 4",
+             self._LA_BATCH_SQL, self._LA_INCR_SQL),
+            ("facilitator_learning_activities", "1, 2",
+             self._FLA_BATCH_SQL, self._FLA_INCR_SQL),
         ]
 
-        for table, types_sql, batch_sql in specs:
+        for table, types_sql, batch_sql, incr_sql in specs:
             try:
-                # Get active user_ids from the local DuckDB users cache.
+                last_ts = self._get_last_completion_ts(table) if incremental else None
+
+                # ── Incremental path ──────────────────────────────────────────
+                if last_ts:
+                    log.info(
+                        "[table_cache] ── %s: incremental refresh ─────────────────",
+                        table,
+                    )
+                    log.info("[table_cache]   last cached completed_at : %s", last_ts)
+                    log.info("[table_cache]   fetching records newer than that ...")
+
+                    df = fetch(SOURCE_DB, incr_sql, (last_ts,))
+
+                    if df.empty:
+                        log.info(
+                            "[table_cache]   %-*s  no new records since %s — cache up to date",
+                            col_w, table, last_ts,
+                        )
+                        log.info("[table_cache] ─" * 30)
+                        continue
+
+                    self._con.register("_incr", df)
+                    self._con.execute(f"INSERT INTO {table} SELECT * FROM _incr")
+                    self._con.unregister("_incr")
+
+                    new_ts = str(df["completed_at"].max())
+                    self._save_last_completion_ts(table, new_ts)
+
+                    # Update row count in meta
+                    total = self._con.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
+                    self._upsert_source_meta(table, total)
+
+                    log.info(
+                        "[table_cache]   %-*s  +%d new rows appended  "
+                        "(total: %d)  new max_ts: %s",
+                        col_w, table, len(df), total, new_ts,
+                    )
+                    log.info("[table_cache] ─────────────────────────────────────────────────────")
+                    continue
+
+                # ── Full refresh path (batch by user_id) ─────────────────────
+                log.info(
+                    "[table_cache] ── %s: full refresh (batch_size=%d) ──────────",
+                    table, batch_size,
+                )
+
                 user_ids = self._con.execute(f"""
                     SELECT id FROM users
                     WHERE status = 1 AND deleted_at IS NULL
@@ -414,10 +550,10 @@ class TableCache:
                     col_w, table, n_users, n_chunks, batch_size,
                 )
 
-                # Drop old table — rebuild fresh every run.
                 self._con.execute(f"DROP TABLE IF EXISTS {table}")
                 table_created = False
                 total_rows    = 0
+                max_ts        = None
 
                 for i, chunk in enumerate(chunks, 1):
                     placeholders = ", ".join(["%s"] * len(chunk))
@@ -438,13 +574,19 @@ class TableCache:
                         self._con.unregister("_tmp")
                         total_rows += len(df)
 
+                        # Track running MAX(completed_at)
+                        if "completed_at" in df.columns:
+                            batch_max = df["completed_at"].max()
+                            if pd.notna(batch_max):
+                                if max_ts is None or batch_max > max_ts:
+                                    max_ts = batch_max
+
                     if i % 50 == 0 or i == n_chunks:
                         log.info(
-                            "[table_cache]   %-*s  batch %d / %d  (total rows so far: %d)",
+                            "[table_cache]   %-*s  batch %d / %d  (rows so far: %d)",
                             col_w, table, i, n_chunks, total_rows,
                         )
 
-                # Ensure table exists even if no rows were returned.
                 if not table_created:
                     self._con.execute(
                         f"CREATE TABLE IF NOT EXISTS {table} "
@@ -452,26 +594,26 @@ class TableCache:
                         f"rating DOUBLE, duration BIGINT, completed INTEGER)"
                     )
 
-                now = datetime.now(timezone.utc).replace(tzinfo=None)
-                self._con.execute("""
-                    INSERT INTO source_table_meta (table_name, row_count, cached_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT (table_name) DO UPDATE SET
-                        row_count = excluded.row_count,
-                        cached_at = excluded.cached_at
-                """, [table, total_rows, now])
+                self._upsert_source_meta(table, total_rows)
+
+                if max_ts is not None:
+                    self._save_last_completion_ts(table, str(max_ts))
+                    log.info(
+                        "[table_cache]   %-*s  max completed_at saved: %s",
+                        col_w, table, max_ts,
+                    )
 
                 log.info(
                     "[table_cache]   %-*s  %10d total rows  ✓ cached",
                     col_w, table, total_rows,
                 )
+                log.info("[table_cache] ─────────────────────────────────────────────────────")
 
             except Exception as exc:
                 log.error("[table_cache]   %-*s  ✗ FAILED: %s", col_w, table, exc)
                 raise
 
-        log.info("[table_cache] Completion tables cached — s3 will query DuckDB this run")
-        log.info("[table_cache] ─────────────────────────────────────────────────────")
+        log.info("[table_cache] Completion tables ready — s3 will query DuckDB this run")
 
     def make_fetch_fn(self):
         """
