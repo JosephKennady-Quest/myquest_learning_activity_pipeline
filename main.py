@@ -55,6 +55,7 @@ import pandas as pd
 
 from config import ANALYTICS_DB, ALLOC_CHUNK_SIZE, STAFF_ALLOC_CHUNK_SIZE, OUTPUT_DIR
 from db import delete_user_rows, write_table
+from steps.s0_cache import AllocationCache
 from steps.s0_changed_users import fetch_changed_user_ids
 from steps.s1_users import fetch_users
 from steps.s2_allocation import fetch_allocation
@@ -139,6 +140,14 @@ def parse_args():
         ),
     )
     p.add_argument("--dry-run", action="store_true", help="Print row counts only, no output written")
+    p.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help=(
+            "Bypass the local allocation cache and re-fetch allocation from production. "
+            "Rebuilds the cache at the end of the run."
+        ),
+    )
     p.add_argument(
         "--start-chunk",
         type=int,
@@ -332,6 +341,7 @@ def run(
     outputs:          str = "lesson,subject,debug",
     all_lesson_types: bool = False,
     start_chunk:      int = 1,
+    force_refresh:    bool = False,
 ) -> pd.DataFrame:
     active = {o.strip().lower() for o in outputs.split(",")}
     mode   = f"incremental (since={since})" if since else "full refresh"
@@ -360,6 +370,27 @@ def run(
             return pd.DataFrame()
         changed_ids = set(ids)
         log.info("Incremental run: %d users with new completions since %s", len(changed_ids), since)
+
+    # ── Local allocation cache ────────────────────────────────────────────────
+    # Cache is only used for full, unscoped runs (no filters, no --since).
+    # Scoped runs are fast enough to always fetch live; --since always needs
+    # live allocation in case allocation changed for those users.
+    _scoped      = any([user_id, centre_id, batch_id, subject_id, trade_id])
+    _cache_eligible = not _scoped and not since and not force_refresh
+
+    cache: AllocationCache | None = None
+    _alloc_from_cache   = False
+    _cache_total_rows   = 0
+    _cache_initialised  = False
+
+    if _cache_eligible:
+        cache = AllocationCache()
+        if not cache.allocation_changed() and cache.is_ready():
+            _alloc_from_cache = True
+            log.info("[cache] Allocation will be loaded from local cache — production allocation queries skipped")
+        else:
+            cache.reset()
+            log.info("[cache] Allocation will be fetched live and cached for future runs")
 
     # ── Step 1: fetch users (lightweight — demographics only)
     users_df = fetch_users(user_id, centre_id, batch_id, trade_id)
@@ -433,12 +464,33 @@ def run(
 
         # ── Step 2: allocation for this chunk ────────────────────────────────
         alloc_paths = ("non_ple", "ple") if chunk_type == "learner" else ("staff",)
-        alloc = fetch_allocation(
-            user_ids=chunk_ids,
-            centre_id=centre_id, batch_id=batch_id,
-            subject_id=subject_id, trade_id=trade_id,
-            paths=alloc_paths,
-        )
+
+        if _alloc_from_cache:
+            # Load from local DuckDB — no SSH connection needed for allocation.
+            try:
+                alloc = cache.load_chunk(chunk_ids)
+            except Exception as exc:
+                log.warning("[cache] Cache read failed (%s) — falling back to live query", exc)
+                alloc = fetch_allocation(
+                    user_ids=chunk_ids,
+                    centre_id=centre_id, batch_id=batch_id,
+                    subject_id=subject_id, trade_id=trade_id,
+                    paths=alloc_paths,
+                )
+        else:
+            alloc = fetch_allocation(
+                user_ids=chunk_ids,
+                centre_id=centre_id, batch_id=batch_id,
+                subject_id=subject_id, trade_id=trade_id,
+                paths=alloc_paths,
+            )
+            # Populate the cache while we go, so subsequent runs can use it.
+            if cache is not None and not alloc.empty:
+                if not _cache_initialised:
+                    cache.init_table(alloc)
+                    _cache_initialised = True
+                cache.append(alloc)
+                _cache_total_rows += len(alloc)
         alloc_filtered = _apply_lesson_type_filter(alloc) if not alloc.empty else alloc
 
         if not alloc.empty:
@@ -578,6 +630,14 @@ def run(
         del alloc, alloc_filtered, compl, result, subject_agg_df, subj_all_df
         gc.collect()
 
+    # ── Finalise allocation cache (only when we just rebuilt it) ─────────────
+    if cache is not None:
+        if not _alloc_from_cache and _cache_total_rows > 0:
+            cache.finalise(_cache_total_rows)
+            cache.save_row_count_snapshot()
+            log.info("[cache] Allocation cache rebuilt — %d rows saved to %s", _cache_total_rows, cache.path)
+        cache.close()
+
     # ── All-lesson-types CSV (small runs only) ────────────────────────────────
     if all_lesson_types and not dry_run and output in ("csv", "both"):
         if all_type_subj_frames:
@@ -636,5 +696,6 @@ if __name__ == "__main__":
         outputs=args.outputs,
         all_lesson_types=args.all_lesson_types,
         start_chunk=args.start_chunk,
+        force_refresh=args.force_refresh,
     )
     sys.exit(0 if not df.empty else 1)
