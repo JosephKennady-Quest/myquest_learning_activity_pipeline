@@ -375,8 +375,12 @@ def run(
     # Cache is only used for full, unscoped runs (no filters, no --since).
     # Scoped runs are fast enough to always fetch live; --since always needs
     # live allocation in case allocation changed for those users.
-    _scoped      = any([user_id, centre_id, batch_id, subject_id, trade_id])
-    _cache_eligible = not _scoped and not since and not force_refresh
+    _scoped         = any([user_id, centre_id, batch_id, subject_id, trade_id])
+    # Cache is used for all full unscoped runs — including --force-refresh.
+    # force_refresh controls whether to REUSE existing cached data, not
+    # whether to use caching at all. Excluding it here was a bug that caused
+    # cache.duckdb to never be built when --force-refresh was passed.
+    _cache_eligible = not _scoped and not since
 
     cache: AllocationCache | None = None
     _alloc_from_cache = False

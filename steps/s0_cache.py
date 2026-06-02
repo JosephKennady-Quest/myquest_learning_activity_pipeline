@@ -276,14 +276,41 @@ class TableCache:
         """)
 
     def is_fresh(self) -> bool:
-        """True if every source table has been cached at least once."""
+        """
+        True only when every source table:
+          1. Has a row in source_table_meta (metadata logged), AND
+          2. Actually exists as a table in DuckDB (data is present).
+        Checking both guards against partial/interrupted first runs where
+        metadata was saved but data was never written (or the file was
+        corrupted), which previously made is_fresh() return True incorrectly
+        and caused the pipeline to query non-existent DuckDB tables.
+        """
         try:
+            # 1. Metadata check
             row = self._con.execute("""
                 SELECT COUNT(*) AS n
                 FROM   source_table_meta
                 WHERE  table_name IN ({})
             """.format(", ".join(f"'{t}'" for t in SOURCE_CACHE_TABLES))).fetchone()
-            return row is not None and row[0] == len(SOURCE_CACHE_TABLES)
+            if row is None or row[0] != len(SOURCE_CACHE_TABLES):
+                return False
+
+            # 2. Actual table existence check
+            existing = set(
+                self._con.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'main'"
+                ).fetchdf()["table_name"].tolist()
+            )
+            missing = [t for t in SOURCE_CACHE_TABLES if t not in existing]
+            if missing:
+                log.warning(
+                    "[table_cache] Metadata says fresh but tables missing in DuckDB: %s "
+                    "— will re-download", missing
+                )
+                return False
+
+            return True
         except Exception:
             return False
 
