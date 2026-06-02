@@ -339,16 +339,14 @@ class TableCache:
         except Exception as exc:
             log.warning("[table_cache] Could not read cache status: %s", exc)
 
-    # Filtered SQL for completion tables — only active users × active lessons,
-    # completed = 1 only (mirrors the WHERE clause in s3_completion._SQL).
-    _LA_SQL = """
+    # Batch SQL for completion tables.
+    # user_ids are passed as %s placeholders (one batch at a time).
+    # lesson_id filter runs as a subquery on production — small tables, fast.
+    _LA_BATCH_SQL = """
         SELECT la.*
         FROM learning_activities la
         WHERE la.completed = 1
-          AND la.user_id IN (
-              SELECT id FROM users
-              WHERE status = 1 AND deleted_at IS NULL AND type IN (3, 4)
-          )
+          AND la.user_id IN ({placeholders})
           AND la.lesson_id IN (
               SELECT DISTINCT l.id
               FROM centre_subject cs
@@ -360,14 +358,11 @@ class TableCache:
           )
     """
 
-    _FLA_SQL = """
+    _FLA_BATCH_SQL = """
         SELECT fla.*
         FROM facilitator_learning_activities fla
         WHERE fla.completed = 1
-          AND fla.user_id IN (
-              SELECT id FROM users
-              WHERE status = 1 AND deleted_at IS NULL AND type IN (1, 2)
-          )
+          AND fla.user_id IN ({placeholders})
           AND fla.lesson_id IN (
               SELECT DISTINCT l.id
               FROM centre_subject cs
@@ -379,34 +374,84 @@ class TableCache:
           )
     """
 
-    def refresh_completion_tables(self):
+    def refresh_completion_tables(self, batch_size: int = 5000):
         """
-        Fetch filtered learning_activities and facilitator_learning_activities
-        from production and store in DuckDB.
+        Fetch learning_activities and facilitator_learning_activities from
+        production in user_id batches and store in DuckDB.
 
-        Called once per run (completion data is live — always refreshed).
-        Filters applied at source:
-          • active users only  (status=1, deleted_at IS NULL, correct type)
-          • active lessons only (status=1, deleted_at IS NULL, in centre_subject)
-          • completed = 1 only (mirrors s3_completion SQL)
+        Batching avoids large single queries that can timeout or exhaust
+        memory on the server.  User IDs are read from the already-cached
+        users table in DuckDB — no extra production query needed.
 
-        After this runs, s3_completion queries DuckDB instead of MySQL,
-        cutting ~2205 per-chunk SSH connections down to 1 upfront fetch.
+        Filters applied per batch:
+          • completed = 1 only
+          • lesson_id must be an active lesson in centre_subject
         """
         col_w = len("facilitator_learning_activities") + 2
-        log.info("[table_cache] ── Caching completion tables from production ─────────")
+        log.info("[table_cache] ── Caching completion tables (batched) ───────────────")
 
-        for table, sql in [
-            ("learning_activities",             self._LA_SQL),
-            ("facilitator_learning_activities", self._FLA_SQL),
-        ]:
+        specs = [
+            ("learning_activities",             "3, 4", self._LA_BATCH_SQL),
+            ("facilitator_learning_activities", "1, 2", self._FLA_BATCH_SQL),
+        ]
+
+        for table, types_sql, batch_sql in specs:
             try:
-                log.info("[table_cache]   %-*s  fetching (filtered: active users × active lessons, completed=1) ...", col_w, table)
-                df = fetch(SOURCE_DB, sql, None)
+                # Get active user_ids from the local DuckDB users cache.
+                user_ids = self._con.execute(f"""
+                    SELECT id FROM users
+                    WHERE status = 1 AND deleted_at IS NULL
+                      AND type IN ({types_sql})
+                """).fetchdf()["id"].tolist()
+
+                n_users  = len(user_ids)
+                chunks   = [user_ids[i:i + batch_size]
+                            for i in range(0, n_users, batch_size)]
+                n_chunks = len(chunks)
+
+                log.info(
+                    "[table_cache]   %-*s  %d users → %d batches of %d",
+                    col_w, table, n_users, n_chunks, batch_size,
+                )
+
+                # Drop old table — rebuild fresh every run.
                 self._con.execute(f"DROP TABLE IF EXISTS {table}")
-                self._con.register("_tmp", df)
-                self._con.execute(f"CREATE TABLE {table} AS SELECT * FROM _tmp")
-                self._con.unregister("_tmp")
+                table_created = False
+                total_rows    = 0
+
+                for i, chunk in enumerate(chunks, 1):
+                    placeholders = ", ".join(["%s"] * len(chunk))
+                    sql = batch_sql.format(placeholders=placeholders)
+                    df  = fetch(SOURCE_DB, sql, tuple(chunk))
+
+                    if not df.empty:
+                        self._con.register("_tmp", df)
+                        if not table_created:
+                            self._con.execute(
+                                f"CREATE TABLE {table} AS SELECT * FROM _tmp"
+                            )
+                            table_created = True
+                        else:
+                            self._con.execute(
+                                f"INSERT INTO {table} SELECT * FROM _tmp"
+                            )
+                        self._con.unregister("_tmp")
+                        total_rows += len(df)
+
+                    if i % 50 == 0 or i == n_chunks:
+                        log.info(
+                            "[table_cache]   %-*s  batch %d / %d  (total rows so far: %d)",
+                            col_w, table, i, n_chunks, total_rows,
+                        )
+
+                # Ensure table exists even if no rows were returned.
+                if not table_created:
+                    self._con.execute(
+                        f"CREATE TABLE IF NOT EXISTS {table} "
+                        f"(user_id VARCHAR, lesson_id VARCHAR, score DOUBLE, "
+                        f"rating DOUBLE, duration BIGINT, completed INTEGER)"
+                    )
+
                 now = datetime.now(timezone.utc).replace(tzinfo=None)
                 self._con.execute("""
                     INSERT INTO source_table_meta (table_name, row_count, cached_at)
@@ -414,8 +459,13 @@ class TableCache:
                     ON CONFLICT (table_name) DO UPDATE SET
                         row_count = excluded.row_count,
                         cached_at = excluded.cached_at
-                """, [table, len(df), now])
-                log.info("[table_cache]   %-*s  %10d rows  ✓ cached", col_w, table, len(df))
+                """, [table, total_rows, now])
+
+                log.info(
+                    "[table_cache]   %-*s  %10d total rows  ✓ cached",
+                    col_w, table, total_rows,
+                )
+
             except Exception as exc:
                 log.error("[table_cache]   %-*s  ✗ FAILED: %s", col_w, table, exc)
                 raise
