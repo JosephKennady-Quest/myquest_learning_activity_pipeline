@@ -378,6 +378,7 @@ def fetch_non_ple_allocation(
     batch_id:   Optional[str]       = None,
     subject_id: Optional[str]       = None,
     trade_id:   Optional[str]       = None,
+    fetch_fn=None,
 ) -> pd.DataFrame:
     """
     Subjects allocated to non-PLE learners (types 3, 4).
@@ -385,7 +386,7 @@ def fetch_non_ple_allocation(
     intersections are applied only when the user has a batch_id / trade_id.
     """
     sql, params = _build(_NON_PLE_SQL, user_id, user_ids, centre_id, batch_id, subject_id, trade_id)
-    df = fetch(SOURCE_DB, sql, params)
+    df = (fetch_fn or fetch)(SOURCE_DB, sql, params)
     log.info("[s2_allocation] non-PLE → %d rows", len(df))
     return df
 
@@ -397,6 +398,7 @@ def fetch_ple_allocation(
     batch_id:   Optional[str]       = None,
     subject_id: Optional[str]       = None,
     trade_id:   Optional[str]       = None,
+    fetch_fn=None,
 ) -> pd.DataFrame:
     """
     Subjects allocated to PLE learners (types 3, 4, is_ple = 1).
@@ -407,7 +409,7 @@ def fetch_ple_allocation(
     is used (enforced via ROW_NUMBER() in the SQL).
     """
     sql, params = _build(_PLE_SQL, user_id, user_ids, centre_id, batch_id, subject_id, trade_id)
-    df = fetch(SOURCE_DB, sql, params)
+    df = (fetch_fn or fetch)(SOURCE_DB, sql, params)
     log.info("[s2_allocation] PLE → %d rows", len(df))
     return df
 
@@ -417,6 +419,7 @@ def fetch_staff_allocation(
     user_ids:   Optional[List[str]] = None,
     centre_id:  Optional[str]       = None,
     subject_id: Optional[str]       = None,
+    fetch_fn=None,
 ) -> pd.DataFrame:
     """
     Subjects allocated to staff (types 1 Admin, 2 Facilitator/Master Trainer).
@@ -427,7 +430,7 @@ def fetch_staff_allocation(
       Master Trainer  → mastertrainer_access = 1
     """
     sql, params = _build_staff(user_id, user_ids, centre_id, subject_id)
-    df = fetch(SOURCE_DB, sql, params)
+    df = (fetch_fn or fetch)(SOURCE_DB, sql, params)
     log.info("[s2_allocation] staff → %d rows", len(df))
     return df
 
@@ -440,6 +443,7 @@ def fetch_allocation(
     subject_id: Optional[str]       = None,
     trade_id:   Optional[str]       = None,
     paths:      tuple               = ("non_ple", "ple", "staff"),
+    fetch_fn=None,
 ) -> pd.DataFrame:
     """
     Combined allocation for users, tagged with 'allocation_path' for traceability.
@@ -452,19 +456,19 @@ def fetch_allocation(
     frames = []
 
     if "non_ple" in paths:
-        non_ple = fetch_non_ple_allocation(user_id, user_ids, centre_id, batch_id, subject_id, trade_id)
+        non_ple = fetch_non_ple_allocation(user_id, user_ids, centre_id, batch_id, subject_id, trade_id, fetch_fn=fetch_fn)
         non_ple["allocation_path"]  = "non_ple"
         non_ple["allocation_basis"] = "centre_subject [→ batch_subject if batch] [→ subject_trade if trade]"
         frames.append(non_ple)
 
     if "ple" in paths:
-        ple = fetch_ple_allocation(user_id, user_ids, centre_id, batch_id, subject_id, trade_id)
+        ple = fetch_ple_allocation(user_id, user_ids, centre_id, batch_id, subject_id, trade_id, fetch_fn=fetch_fn)
         ple["allocation_path"]      = "ple"
         ple["allocation_basis"]     = "centre_subject [→ subject_ple_career_path if career_path] [→ batch_subject if batch]"
         frames.append(ple)
 
     if "staff" in paths:
-        staff = fetch_staff_allocation(user_id, user_ids, centre_id, subject_id)
+        staff = fetch_staff_allocation(user_id, user_ids, centre_id, subject_id, fetch_fn=fetch_fn)
         staff["allocation_path"]    = "staff"
         staff["allocation_basis"]   = "centre_subject (admin: all; facilitator: facilitator_access; master_trainer: mastertrainer_access)"
         frames.append(staff)

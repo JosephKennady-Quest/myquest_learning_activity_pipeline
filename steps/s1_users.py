@@ -58,6 +58,7 @@ def fetch_users(
     centre_id: Optional[str] = None,
     batch_id:  Optional[str] = None,
     trade_id:  Optional[str] = None,
+    fetch_fn=None,
 ) -> pd.DataFrame:
     """
     Return all active users (types 1–4) with their profile.
@@ -79,6 +80,8 @@ def fetch_users(
         params.append(trade_id)
 
     sql = _SQL.format(types=ALL_TYPES_SQL, user_clause="\n  ".join(clauses))
-    df = fetch(SOURCE_DB, sql, tuple(params) if params else None)
-    log.info("[s1_users] fetched %d users (types 1–4)", len(df))
+    _fetch = fetch_fn or fetch
+    src    = "DuckDB cache" if fetch_fn else "production"
+    df     = _fetch(SOURCE_DB, sql, tuple(params) if params else None)
+    log.info("[s1_users] fetched %d users (types 1–4) from %s", len(df), src)
     return df

@@ -55,7 +55,7 @@ import pandas as pd
 
 from config import ANALYTICS_DB, ALLOC_CHUNK_SIZE, STAFF_ALLOC_CHUNK_SIZE, OUTPUT_DIR
 from db import delete_user_rows, write_table
-from steps.s0_cache import AllocationCache
+from steps.s0_cache import AllocationCache, TableCache
 from steps.s0_changed_users import fetch_changed_user_ids
 from steps.s1_users import fetch_users
 from steps.s2_allocation import fetch_allocation
@@ -383,17 +383,36 @@ def run(
     _cache_total_rows   = 0
     _cache_initialised  = False
 
+    # fetch_fn is passed to s1 + s2 so they query DuckDB instead of MySQL.
+    # None means fall back to the normal db.fetch (production MySQL).
+    fetch_fn = None
+
     if _cache_eligible:
         cache = AllocationCache()
-        if not cache.allocation_changed() and cache.is_ready():
+        tbl   = TableCache(cache._con)
+
+        # ── Layer 1: source table cache ───────────────────────────────────────
+        alloc_changed = cache.allocation_changed()
+
+        if alloc_changed or not tbl.is_fresh() or force_refresh:
+            log.info("[table_cache] Refreshing source tables from production ...")
+            tbl.refresh()
+        else:
+            tbl.log_status()
+
+        fetch_fn = tbl.make_fetch_fn()
+        log.info("[table_cache] s1_users + s2_allocation will query DuckDB cache")
+
+        # ── Layer 2: allocation result cache ──────────────────────────────────
+        if not alloc_changed and cache.is_ready() and not force_refresh:
             _alloc_from_cache = True
-            log.info("[cache] Allocation will be loaded from local cache — production allocation queries skipped")
+            log.info("[cache] Allocation result cache valid — chunk allocation loads from DuckDB")
         else:
             cache.reset()
-            log.info("[cache] Allocation will be fetched live and cached for future runs")
+            log.info("[cache] Allocation result cache will be rebuilt this run")
 
     # ── Step 1: fetch users (lightweight — demographics only)
-    users_df = fetch_users(user_id, centre_id, batch_id, trade_id)
+    users_df = fetch_users(user_id, centre_id, batch_id, trade_id, fetch_fn=fetch_fn)
     if users_df.empty:
         log.warning("No users found — exiting.")
         return pd.DataFrame()
@@ -485,8 +504,10 @@ def run(
                 centre_id=centre_id, batch_id=batch_id,
                 subject_id=subject_id, trade_id=trade_id,
                 paths=alloc_paths,
+                fetch_fn=fetch_fn,
             )
-            log.info("[cache] Chunk %d allocation → production (caching for next run)", chunk_idx)
+            src = "DuckDB" if fetch_fn else "production"
+            log.info("[cache] Chunk %d allocation → %s (caching result for next run)", chunk_idx, src)
             # Populate the cache while we go, so subsequent runs can use it.
             if cache is not None and not alloc.empty:
                 if not _cache_initialised:
