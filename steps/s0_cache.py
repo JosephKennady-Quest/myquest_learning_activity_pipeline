@@ -333,19 +333,35 @@ class TableCache:
         NaT becomes the uniform null sentinel — safe for DuckDB and pandas.
         """
         import datetime as _dt
+        from decimal import Decimal as _Decimal
+
         _ZERO_STR = "0000-00-00 00:00:00"
         _ZERO_DT  = _dt.datetime(1, 1, 1, 0, 0)
 
         for col in df.columns:
             if df[col].dtype == object:
-                # Step 1: replace zero-date strings with None
+                # Replace zero-date strings first
                 df[col] = df[col].replace(_ZERO_STR, None)
 
-                # Step 2: if column holds datetime objects, convert to
-                # datetime64 so .max() and DuckDB both work correctly
                 non_null = df[col].dropna()
-                if not non_null.empty and isinstance(non_null.iloc[0], _dt.datetime):
+                if non_null.empty:
+                    continue
+                sample = non_null.iloc[0]
+
+                if isinstance(sample, _dt.datetime):
+                    # Datetime column — convert to datetime64.
+                    # Keeps NaT as the null sentinel (safe for DuckDB and
+                    # pandas .max()). Without this, None mixes with datetime
+                    # objects causing '>=' not supported between datetime and float.
                     df[col] = pd.to_datetime(df[col], errors="coerce")
+
+                elif isinstance(sample, _Decimal):
+                    # MySQL DECIMAL columns — pymysql returns Python Decimal objects.
+                    # DuckDB infers a narrow DECIMAL(p,s) from the first batch
+                    # and rejects larger values in later batches (e.g. 100.0000
+                    # overflows DECIMAL(6,4)). Convert to float64 so DuckDB uses
+                    # DOUBLE, which has no precision overflow issues.
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
 
             elif pd.api.types.is_datetime64_any_dtype(df[col]):
                 # Already proper dtype — NaT is safe for DuckDB
