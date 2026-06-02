@@ -1,5 +1,6 @@
 # ── Credentials and private keys ─────────────────────────────
 .env
+*.pem
 DB_Config/
 
 # ── Python runtime ────────────────────────────────────────────
