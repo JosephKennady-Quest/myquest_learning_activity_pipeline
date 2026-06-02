@@ -16,6 +16,7 @@ A Python data pipeline that tracks **user-level learning activity allocation and
   - [Step 1 — User Fetch](#step-1--user-fetch-s1_userspy)
   - [Step 2 — Toolkit Allocation](#step-2--toolkit-allocation-s2_allocationpy)
   - [Step 3 — Completion & Merge](#step-3--completion--merge-s3_completionpy)
+  - [Step 4 — User Project/Phase JSON](#step-4--user-projectphase-json-s4_users_project_phase_jsonpy)
 - [Allocation Logic](#allocation-logic)
   - [Non-PLE Path](#non-ple-path)
   - [PLE Path](#ple-path)
@@ -85,9 +86,13 @@ quest_rearch_production (source DB — read only)
         └── facilitator_learning_activities    ┘ (routed by user_type)
 
 quest_analytics (analytics DB — write only)
-        ├── main_learning_activity_myquest_ael                ← subject-level, filtered
-        ├── main_learning_activity_myquest_ael_all_lesson_type ← subject-level, all types
-        └── main_learning_activity_myquest_ael_lesson         ← lesson-level, filtered
+        ├── main_learning_activity_myquest_ael                ← subject-level, filtered         ┐ Steps 1–3
+        ├── main_learning_activity_myquest_ael_all_lesson_type ← subject-level, all types       │
+        ├── main_learning_activity_myquest_ael_lesson         ← lesson-level, filtered          ┘
+        │
+        └── main_wcc_json                                     ← one row per user (Step 4)
+                ├── project_phase_combos  JSON  ← from main_centre_project + main_phases
+                └── subject_combos        JSON  ← from main_learning_activity_myquest_ael
 
                         ↓
               pandas merge (LEFT JOIN allocation × completion)
@@ -233,13 +238,22 @@ ael_v2_pipeline/
 │   │                     # Applies year_to_map <= trade.duration filter (learners)
 │   │                     # Optional batch/trade intersection (LEFT JOIN + NULL guards)
 │   │
-│   └── s3_completion.py  # Completion data from source DB:
-│                         #   fetch_student_completion()     — learning_activities
-│                         #   fetch_facilitator_completion() — facilitator_learning_activities
-│                         #   fetch_completion()             — auto-routes by user_type
-│                         #   merge_completion()             — LEFT JOIN + summary + filter
+│   ├── s3_completion.py  # Completion data from source DB:
+│   │                     #   fetch_student_completion()     — learning_activities
+│   │                     #   fetch_facilitator_completion() — facilitator_learning_activities
+│   │                     #   fetch_completion()             — auto-routes by user_type
+│   │                     #   merge_completion()             — LEFT JOIN + summary + filter
+│   │
+│   └── s4_users_project_phase_json.py
+│                         # One-row-per-user JSON builder (analytics DB only):
+│                         #   fetch_users_project_phase()    — main_users LEFT JOIN main_centre_project + main_phases
+│                         #   fetch_subjects()               — main_learning_activity_myquest_ael
+│                         #   build_users_project_phase_json() — collapse to project_phase_combos JSON per user
+│                         #   build_subject_json()           — collapse to subject_combos JSON per user
+│                         #   run_users_project_phase_json() — orchestrates all four, returns merged DataFrame
 │
-├── main.py               # CLI entry point / orchestrator
+├── main.py               # CLI entry point / orchestrator (Steps 1–3)
+├── main_wcc_json_v2.py   # CLI entry point for Step 4 (JSON output)
 │                         # Args: --user-id, --centre-id, --batch-id, --subject-id,
 │                         #       --trade-id, --output db(default)/csv/both,
 │                         #       --outputs, --all-lesson-types, --since, --dry-run,
@@ -316,6 +330,118 @@ merge_completion(allocation_df, completion_df) # LEFT JOIN + summary stats + stu
 | 1, 2 (Admin, Facilitator/MT) | `facilitator_learning_activities` |
 
 `main.py` extracts the unique `user_type` values from the allocation DataFrame and passes them to `fetch_completion()` — routing is automatic and transparent.
+
+---
+
+### Step 4 — User Project/Phase JSON (`s4_users_project_phase_json.py`)
+
+Builds a **one-row-per-user** JSON output table (`quest_analytics.main_wcc_json`) that consolidates project, phase, and subject data per user. Because a single user can belong to multiple projects and phases, repeating values are collapsed into two JSON columns instead of producing multiple rows.
+
+**Source tables (all from `quest_analytics`):**
+
+| Table | Role |
+|---|---|
+| `main_users` | Base user list — one row per user, drives the output shape |
+| `main_centre_project` | Maps centre → project (LEFT JOIN on `centre_id`) |
+| `main_phases` | Maps batch + centre + project + user → phase (LEFT JOIN, inner join on `p_user_id`) |
+| `main_learning_activity_myquest_ael` | Subject-level completion data for `subject_combos` JSON |
+
+**Join logic:**
+
+```
+main_users u
+  LEFT JOIN main_centre_project cp  ON cp.centre_id   = u.centre_id
+  LEFT JOIN main_phases ph          ON ph.p_batch_id   = u.batch_id
+                                    AND ph.p_centre_id  = u.centre_id
+                                    AND ph.p_project_id = cp.project_id
+                                    AND ph.p_user_id    = u.id
+```
+
+**Output JSON columns:**
+
+`project_phase_combos` — one entry per unique project/phase combination the user belongs to:
+
+| Field | Source |
+|---|---|
+| `prog_name` | `main_centre_project.program_name` |
+| `project_id` | `main_centre_project.project_id` |
+| `proj_name` | `main_centre_project.project_name` |
+| `p_phase_id` | `main_phases.p_phase_id` |
+| `phase` | `main_phases.phase_name` |
+
+`subject_combos` — one entry per subject allocated and/or completed by the user:
+
+| Field | Source |
+|---|---|
+| `sub_id` | `subject_id` |
+| `sub_name` | `subject_name` |
+| `avg_score_a` | `avg_score` |
+| `avg_rating_a` | `avg_rating` |
+| `c_sub_w_less_asse_c` | `subj_total_completed` |
+| `a_sub_w_less_asse_c` | `subj_total_allocated` |
+| `a_sub_w_assess_c` | `subj_assessments_allocated` |
+| `a_sub_w_lesson_c` | `subj_lessons_allocated` |
+| `c_sub_w_assess_c` | `subj_assessments_completed` |
+| `c_sub_w_less_c` | `subj_lessons_completed` |
+| `year_category` | `year_to_map` |
+
+**Key functions:**
+
+| Function | Description |
+|---|---|
+| `fetch_users_project_phase()` | Fetches the joined user + project/phase rows from analytics DB |
+| `fetch_subjects()` | Fetches subject-level rows from `main_learning_activity_myquest_ael` |
+| `build_users_project_phase_json()` | Collapses multi-row join result into one row per user with `project_phase_combos` JSON |
+| `build_subject_json()` | Collapses subject rows into `subject_combos` JSON per user |
+| `run_users_project_phase_json()` | Orchestrates all four functions and merges the result |
+
+All filters (`--user-id`, `--centre-id`, `--batch-id`) are passed through to both fetch functions so scoped runs work correctly.
+
+**Running step 4 via `main_wcc_json_v2.py`:**
+
+```bash
+# Full refresh into quest_analytics.main_wcc_json
+python main_wcc_json_v2.py
+
+# Dry run only
+python main_wcc_json_v2.py --dry-run
+
+# Test one user, write to CSV
+python main_wcc_json_v2.py --user-id <tlo_user_id> --output csv
+
+# Write both CSV and DB
+python main_wcc_json_v2.py --output both
+```
+
+**Querying the JSON output in MySQL:**
+
+```sql
+-- Find all users in a specific project and phase
+SELECT DISTINCT u.*
+FROM quest_analytics.main_wcc_json u
+JOIN JSON_TABLE(
+    u.project_phase_combos,
+    '$[*]' COLUMNS (
+        proj_name VARCHAR(255) PATH '$.proj_name',
+        phase     VARCHAR(255) PATH '$.phase'
+    )
+) jt
+WHERE jt.proj_name = 'Project A'
+  AND jt.phase = 'Phase 1';
+
+-- Find all users with a specific subject
+SELECT DISTINCT u.tlo_user_id, u.centre_name
+FROM quest_analytics.main_wcc_json u
+JOIN JSON_TABLE(
+    u.subject_combos,
+    '$[*]' COLUMNS (
+        sub_name VARCHAR(255) PATH '$.sub_name'
+    )
+) jt
+WHERE jt.sub_name = 'Digital Literacy';
+```
+
+> The JSON structure follows the same field names used in `Cust JSON version/json_main_wcc_try.ipynb` for consistency with the existing WCC JSON pipeline.
 
 ---
 
@@ -627,57 +753,6 @@ Same schema as `main_learning_activity_myquest_ael` above, but **includes pdf, m
 
 ## Running the Pipeline
 
-### User Project/Phase JSON Table
-
-Builds `quest_analytics.main_wcc_json` with one row per `tlo_user_id` from
-`quest_analytics.main_users`. Repeating project/phase and subject values are
-stored in JSON columns using only the same fields from
-`Cust JSON version/json_main_wcc_try.ipynb`.
-
-`project_phase_combos` uses:
-
-```text
-prog_name, project_id, proj_name, p_phase_id, phase
-```
-
-`subject_combos` uses:
-
-```text
-sub_id, sub_name, avg_score_a, avg_rating_a,
-c_sub_w_less_asse_c, a_sub_w_less_asse_c, a_sub_w_assess_c,
-a_sub_w_lesson_c, c_sub_w_assess_c, c_sub_w_less_c, year_category
-```
-
-```bash
-# Full refresh into quest_analytics.main_wcc_json
-python main_wcc_json_v2.py
-
-# Dry run only
-python main_wcc_json_v2.py --dry-run
-
-# Test one user
-python main_wcc_json_v2.py --user-id <tlo_user_id> --output csv
-
-# Write CSV and DB
-python main_wcc_json_v2.py --output both
-```
-
-Search inside the JSON table with MySQL:
-
-```sql
-SELECT DISTINCT u.*
-FROM quest_analytics.main_wcc_json u
-JOIN JSON_TABLE(
-    u.project_phase_combos,
-    '$[*]' COLUMNS (
-        proj_name VARCHAR(255) PATH '$.proj_name',
-        phase     VARCHAR(255) PATH '$.phase'
-    )
-) jt
-WHERE jt.proj_name = 'Project A'
-  AND jt.phase = 'Phase 1';
-```
-
 ### All Users — Full Refresh
 
 ```bash
@@ -954,13 +1029,14 @@ STAFF_ALLOC_CHUNK_SIZE = 200    # staff per allocation query (admins get many mo
 | `learning_activities` | Completion for user types 3, 4 |
 | `facilitator_learning_activities` | Completion for user types 1, 2 |
 
-### Analytics Tables (`quest_ple_analytics`)
+### Analytics Tables (`quest_analytics`)
 
-| Table | Role |
-|---|---|
-| `main_learning_activity_myquest_ael` | Subject-level, filtered (excludes pdf/mp4/pdf web) |
-| `main_learning_activity_myquest_ael_all_lesson_type` | Subject-level, all lesson types |
-| `main_learning_activity_myquest_ael_lesson` | Lesson-level detail, filtered |
+| Table | Role | Written by |
+|---|---|---|
+| `main_learning_activity_myquest_ael` | Subject-level, filtered (excludes pdf/mp4/pdf web) | `main.py` (Steps 1–3) |
+| `main_learning_activity_myquest_ael_all_lesson_type` | Subject-level, all lesson types | `main.py` (Steps 1–3) |
+| `main_learning_activity_myquest_ael_lesson` | Lesson-level detail, filtered | `main.py` (Steps 1–3) |
+| `main_wcc_json` | One row per user — project/phase and subject data as JSON | `main_wcc_json_v2.py` (Step 4) |
 
 ---
 
