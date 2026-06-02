@@ -39,6 +39,15 @@ A Python data pipeline that tracks **user-level learning activity allocation and
   - [Dry Run](#dry-run)
 - [Incremental Runs](#incremental-runs)
 - [Large Runs and Chunked Processing](#large-runs-and-chunked-processing)
+- [Local DuckDB Cache](#local-duckdb-cache)
+  - [How It Works](#how-it-works)
+  - [Two-Layer Cache Strategy](#two-layer-cache-strategy)
+  - [Source Table Cache](#source-table-cache-layer-1)
+  - [Completion Table Cache](#completion-table-cache-incremental)
+  - [Allocation Result Cache](#allocation-result-cache-layer-2)
+  - [Allocation Change Detection](#allocation-change-detection)
+  - [Cache Log Output](#cache-log-output)
+  - [Cache Commands](#cache-commands)
 - [Database Reference](#database-reference)
 - [Understanding toolkit_type](#understanding-toolkit_type)
 - [SSH Tunnel Architecture](#ssh-tunnel-architecture)
@@ -70,30 +79,38 @@ All four paths are merged into a single output with an `allocation_path` column 
 ```
 quest_rearch_production (source DB — read only)
         │
-        ├── users + student_details            → Step 1: user list (types 1–4)
+        │  ◄── SSH tunnel (paramiko) ──────────────────────────────────────────
         │
-        ├── centre_subject                     ┐
-        ├── batch_subject                      │ Step 2: allocation
-        ├── subject_trade                      │  non_ple path: centre ∩ batch ∩ trade
-        ├── subject_ple_career_path            │  ple path:    centre ∩ career path ∩ batch
-        ├── ple_career_path_user               │  staff path:  centre only
+        ├── users + student_details            ┐ cached in DuckDB at startup
+        ├── centre_subject                     │ (refreshed when allocation
+        ├── batch_subject                      │  tables change)
+        ├── subject_trade                      │
+        ├── subject_ple_career_path            │
+        ├── ple_career_path_user               │
         ├── ple_career_paths                   │
-        ├── subjects + lessons                 │
-        ├── lesson_types                       │
-        └── trades                             ┘  ← year_to_map duration filter
+        ├── subjects + lessons + lesson_types  │
+        └── trades                             ┘
         │
-        ├── learning_activities                ┐ Step 3: completion
-        └── facilitator_learning_activities    ┘ (routed by user_type)
+        ├── learning_activities                ┐ cached in DuckDB every run
+        └── facilitator_learning_activities    ┘ (incremental: only new
+                                                  completed_at > last run)
 
-quest_analytics (analytics DB — write only)
-        ├── main_learning_activity_myquest_ael                ← subject-level, filtered         ┐ Steps 1–3
-        ├── main_learning_activity_myquest_ael_all_lesson_type ← subject-level, all types       │
-        ├── main_learning_activity_myquest_ael_lesson         ← lesson-level, filtered          ┘
+        cache.duckdb  (local file — gitignored)
         │
-        └── main_wcc_json                                     ← one row per user (Step 4)
-                ├── project_phase_combos  JSON  ← from main_centre_project + main_phases
-                └── subject_combos        JSON  ← from main_learning_activity_myquest_ael
+        ├── Layer 1 — source tables (users, subjects, lessons, …)
+        │            s1 + s2 queries run locally, no SSH per chunk
+        │
+        ├── Layer 1b — completion tables (learning_activities, …)
+        │             s3 queries run locally, no SSH per chunk
+        │
+        └── Layer 2 — allocation result cache
+                      per-chunk allocation loaded directly from DuckDB
+                      (skips even the local JOIN queries when unchanged)
 
+                        ↓
+              Step 1: fetch users          → DuckDB (Layer 1)
+              Step 2: fetch allocation     → DuckDB (Layer 1 or Layer 2)
+              Step 3: fetch completion     → DuckDB (Layer 1b)
                         ↓
               pandas merge (LEFT JOIN allocation × completion)
                         ↓
@@ -103,6 +120,15 @@ quest_analytics (analytics DB — write only)
               │  Final Output       │
               │  (DB tables / CSV)  │
               └─────────────────────┘
+
+quest_analytics (analytics DB — write only)
+        ├── main_learning_activity_myquest_ael                ← subject-level, filtered         ┐ Steps 1–3
+        ├── main_learning_activity_myquest_ael_all_lesson_type ← subject-level, all types       │
+        ├── main_learning_activity_myquest_ael_lesson         ← lesson-level, filtered          ┘
+        │
+        └── main_wcc_json                                     ← one row per user (Step 4)
+                ├── project_phase_combos  JSON  ← from main_centre_project + main_phases
+                └── subject_combos        JSON  ← from main_learning_activity_myquest_ael
 ```
 
 ---
@@ -149,6 +175,7 @@ pip install -r requirements.txt
 | `paramiko >= 3.0` | SSH client for tunnel implementation (replaces sshtunnel) |
 | `python-dotenv >= 1.0` | Loads `.env` credentials into environment variables |
 | `SQLAlchemy >= 2.0` | Retained for compatibility; not used for active queries |
+| `duckdb >= 0.10` | Local columnar cache — stores source tables and allocation results |
 
 > **Why no `sshtunnel`?** The `sshtunnel` library (v0.4.0) references `paramiko.DSSKey` which was removed in paramiko 3.x. The pipeline uses a custom local port forwarder built directly on `paramiko` — see [SSH Tunnel Architecture](#ssh-tunnel-architecture).
 
@@ -224,21 +251,38 @@ ael_v2_pipeline/
 ├── steps/
 │   ├── __init__.py
 │   │
+│   ├── s0_cache.py       # DuckDB local cache manager — two classes:
+│   │                     #
+│   │                     #   TableCache
+│   │                     #     refresh()                  — fetch source tables from production → DuckDB
+│   │                     #     refresh_completion_tables()— fetch learning_activities in batches
+│   │                     #                                  incremental by default (completed_at > last_ts)
+│   │                     #     make_fetch_fn()            — returns DuckDB-backed fetch (drop-in for db.fetch)
+│   │                     #     log_status()               — print per-table row count + cached_at
+│   │                     #     is_fresh()                 — True if all source tables are cached
+│   │                     #
+│   │                     #   AllocationCache
+│   │                     #     allocation_changed()       — compare 8 table row counts vs snapshot
+│   │                     #     save_row_count_snapshot()  — store current counts after run
+│   │                     #     append(df)                 — add chunk to allocation_cache table
+│   │                     #     finalise(total_rows)       — mark cache complete
+│   │                     #     load_chunk(user_ids)       — load allocation from DuckDB by user_ids
+│   │                     #     reset()                    — drop allocation_cache for rebuild
+│   │
 │   ├── s0_changed_users.py  # Incremental mode: finds user_ids with new completions
 │   │                        # since a given timestamp (queries learning_activities.completed_at)
 │   │
 │   ├── s1_users.py       # Fetch active users ALL types (1–4) with student_details profile
-│   │                     # Staff (types 1,2) have NULL for student_details columns
+│   │                     # fetch_fn=None param — uses DuckDB when cache is active
 │   │
 │   ├── s2_allocation.py  # Core allocation logic — three paths:
 │   │                     #   fetch_non_ple_allocation()   — learner/alumni non-PLE
 │   │                     #   fetch_ple_allocation()       — learner/alumni PLE
 │   │                     #   fetch_staff_allocation()     — Admin + Facilitator/MT
 │   │                     #   fetch_allocation(paths=...)  — combined, deduplicated
-│   │                     # Applies year_to_map <= trade.duration filter (learners)
-│   │                     # Optional batch/trade intersection (LEFT JOIN + NULL guards)
+│   │                     # All functions accept fetch_fn=None (DuckDB or production)
 │   │
-│   ├── s3_completion.py  # Completion data from source DB:
+│   ├── s3_completion.py  # Completion data — accepts fetch_fn=None:
 │   │                     #   fetch_student_completion()     — learning_activities
 │   │                     #   fetch_facilitator_completion() — facilitator_learning_activities
 │   │                     #   fetch_completion()             — auto-routes by user_type
@@ -254,6 +298,7 @@ ael_v2_pipeline/
 │
 ├── main.py               # CLI entry point / orchestrator (Steps 1–3)
 ├── main_wcc_json_v2.py   # CLI entry point for Step 4 (JSON output)
+├── cache.duckdb          # Local DuckDB cache file (gitignored — auto-created on first run)
 │                         # Args: --user-id, --centre-id, --batch-id, --subject-id,
 │                         #       --trade-id, --output db(default)/csv/both,
 │                         #       --outputs, --all-lesson-types, --since, --dry-run,
@@ -885,6 +930,16 @@ This adds two extra CSV files:
 
 ---
 
+### Force Refresh Cache
+
+```bash
+python main.py --force-refresh
+```
+
+Bypasses both cache layers and rebuilds everything from production from scratch. Use this after a major data change or if the cache file becomes corrupted.
+
+---
+
 ### Dry Run
 
 ```bash
@@ -1005,6 +1060,166 @@ STAFF_ALLOC_CHUNK_SIZE = 200    # staff per allocation query (admins get many mo
 |---|---|---|
 | Full refresh | DROP + CREATE + INSERT | INSERT (append) |
 | Incremental | DELETE user rows + INSERT | DELETE user rows + INSERT |
+
+---
+
+## Local DuckDB Cache
+
+### How It Works
+
+The pipeline uses a local DuckDB file (`cache.duckdb`) to cache source tables and allocation results. This eliminates the majority of SSH tunnel connections on every run — from ~6,600 connections down to ~9.
+
+| Without cache | With cache |
+|---|---|
+| s1 users: 1 SSH per run | 0 — reads from DuckDB |
+| s2 allocation: ~4,410 SSH (2 per chunk × 2205 chunks) | 0 — reads from DuckDB |
+| s3 completion: ~2,205 SSH (1 per chunk) | 1 — one upfront fetch, then DuckDB |
+| Allocation change check: 8 COUNT(*) | 8 COUNT(*) (always live) |
+| **Total ~6,616** | **~9** |
+
+The cache is only active for **full unscoped runs** (no `--user-id` / `--centre-id` / `--batch-id` / `--subject-id` / `--trade-id` filters, no `--since`). Scoped runs always use live production queries — they are fast and this keeps cache logic simple.
+
+---
+
+### Two-Layer Cache Strategy
+
+**Layer 1 — Source Table Cache (`TableCache`)**
+
+Caches individual source tables from `quest_rearch_production` into DuckDB. Once cached, `s1_users` and `s2_allocation` run their existing SQL queries locally against DuckDB using a drop-in fetch function.
+
+SQL adaptations applied automatically by the DuckDB fetch function:
+- `%s` → `?` (placeholder style)
+- `` `identifier` `` → `"identifier"` (quoting style)
+
+**Layer 1b — Completion Table Cache (incremental)**
+
+`learning_activities` and `facilitator_learning_activities` are also cached — filtered to active users × active lessons × `completed = 1`. These are refreshed on every run using incremental logic (see below).
+
+**Layer 2 — Allocation Result Cache (`AllocationCache`)**
+
+After `s2_allocation` runs (whether against DuckDB or MySQL), the full allocation result is saved chunk-by-chunk into `allocation_cache` in DuckDB. On subsequent runs where allocation is confirmed unchanged, each chunk's allocation is loaded directly from this result cache — skipping even the local DuckDB JOIN queries.
+
+---
+
+### Source Table Cache (Layer 1)
+
+Tables cached from `quest_rearch_production`:
+
+| Table | Refresh trigger |
+|---|---|
+| `users` | When any allocation watch table row count changes |
+| `student_details` | Same |
+| `subjects` | Same |
+| `lessons` | Same |
+| `lesson_types` | Same |
+| `trades` | Same |
+| `centre_subject` | Same |
+| `batch_subject` | Same |
+| `subject_trade` | Same |
+| `ple_career_paths` | Same |
+| `subject_ple_career_path` | Same |
+| `ple_career_path_user` | Same |
+
+**Allocation watch tables** (row counts compared on every run to detect changes):
+`centre_subject`, `batch_subject`, `subject_trade`, `ple_career_paths`, `subject_ple_career_path`, `ple_career_path_user`, `subjects`, `lessons`
+
+---
+
+### Completion Table Cache (Incremental)
+
+`learning_activities` and `facilitator_learning_activities` are loaded with filters applied at source:
+- `completed = 1` only
+- Active users only (`status = 1`, `deleted_at IS NULL`, correct `type`)
+- Active lessons only — must appear in `centre_subject` JOIN `lessons` JOIN `subjects` (all active)
+
+**First run / `--force-refresh` — full batch refresh:**
+
+User IDs are read from the already-cached `users` table in DuckDB (no extra SSH). Records are fetched from production in batches of 5,000 user IDs at a time to avoid large single queries.
+
+After loading, `MAX(completed_at)` is stored in `cache_meta`.
+
+**Subsequent runs — incremental refresh:**
+
+Only fetches records where `completed_at > last_cached_ts` and appends them to the existing DuckDB table. The `s3_completion` SQL already uses `MAX(score)` / `SUM(duration)` with `GROUP BY (user_id, lesson_id)`, so any duplicate keys from incremental appends are correctly aggregated at query time.
+
+If no new records exist since the last run, the table is left untouched and a log line confirms it.
+
+---
+
+### Allocation Result Cache (Layer 2)
+
+Built on top of Layer 1. After the allocation queries run (against DuckDB), the result for every chunk is appended to `allocation_cache`. On the next run:
+
+1. Row counts of the 8 allocation watch tables are checked (fast — 8 COUNT(*) queries)
+2. If unchanged → load each chunk's allocation directly from `allocation_cache` (single DuckDB SELECT WHERE user_id IN (...))
+3. If changed → drop `allocation_cache`, rebuild it from fresh allocation queries, save new snapshot
+
+---
+
+### Allocation Change Detection
+
+At pipeline startup, the `AllocationCache` runs a COUNT(*) on each of the 8 allocation watch tables and compares against the stored snapshot. The log output shows the result clearly:
+
+```
+[cache] ── Cache status: checking allocation tables ──────────────
+[cache]   centre_subject        ok        rows=45231    (snapped: 2026-06-02 17:30:00)
+[cache]   batch_subject         ok        rows=12840    (snapped: 2026-06-02 17:30:00)
+[cache]   subject_trade         ok        rows=8920     (snapped: 2026-06-02 17:30:00)
+[cache]   ple_career_paths      ok        rows=312      (snapped: 2026-06-02 17:30:00)
+[cache]   subjects              ok        rows=2841     (snapped: 2026-06-02 17:30:00)
+[cache]   lessons               ok        rows=28410    (snapped: 2026-06-02 17:30:00)
+[cache] ── Result: ALL CACHED  ✓ — allocation will load from DuckDB ─
+```
+
+If any table changed:
+
+```
+[cache]   centre_subject        CHANGED   stored=45231   current=45250    (snapped: 2026-06-02)
+[cache] ── Result: CHANGED (trigger: centre_subject) — full allocation refresh ─
+```
+
+---
+
+### Cache Log Output
+
+**Source table cache (startup):**
+```
+[table_cache] ── Cache status ──────────────────────────────────────
+[table_cache]   users                968765 rows  (cached: 2026-06-02 17:30:00)
+[table_cache]   student_details      935509 rows  (cached: 2026-06-02 17:30:00)
+[table_cache]   subjects               2841 rows  (cached: 2026-06-02 17:30:00)
+[table_cache]   lessons               28410 rows  (cached: 2026-06-02 17:30:00)
+...
+[table_cache] s1 + s2 + s3 will all query DuckDB cache this run
+```
+
+**Completion table cache (every run — incremental):**
+```
+[table_cache] ── learning_activities: incremental refresh ─────────────
+[table_cache]   last cached completed_at : 2026-06-02 17:45:23
+[table_cache]   fetching records newer than that ...
+[table_cache]   learning_activities   +12,340 new rows appended  (total: 4,835,381)
+```
+
+**Per-chunk allocation source:**
+```
+[cache] Chunk 1 allocation → DuckDB (170,541 rows)
+[s3_completion] learning_activities → 14,920 rows  [DuckDB cache]
+```
+
+---
+
+### Cache Commands
+
+| Scenario | Command |
+|---|---|
+| First time setup | `python main.py --force-refresh` |
+| Normal daily run | `python main.py` (incremental by default) |
+| Allocation tables changed | `python main.py` (auto-detected, cache rebuilt) |
+| Force full cache rebuild | `python main.py --force-refresh` |
+| Cache file corrupted | Delete `cache.duckdb`, then `python main.py --force-refresh` |
+
+> **`cache.duckdb` is gitignored** — it is never committed. Each server maintains its own local cache file. On a new server, simply run `python main.py --force-refresh` to build the cache from scratch.
 
 ---
 
