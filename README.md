@@ -627,6 +627,57 @@ Same schema as `main_learning_activity_myquest_ael` above, but **includes pdf, m
 
 ## Running the Pipeline
 
+### User Project/Phase JSON Table
+
+Builds `quest_analytics.main_wcc_json` with one row per `tlo_user_id` from
+`quest_analytics.main_users`. Repeating project/phase and subject values are
+stored in JSON columns using only the same fields from
+`Cust JSON version/json_main_wcc_try.ipynb`.
+
+`project_phase_combos` uses:
+
+```text
+prog_name, project_id, proj_name, p_phase_id, phase
+```
+
+`subject_combos` uses:
+
+```text
+sub_id, sub_name, avg_score_a, avg_rating_a,
+c_sub_w_less_asse_c, a_sub_w_less_asse_c, a_sub_w_assess_c,
+a_sub_w_lesson_c, c_sub_w_assess_c, c_sub_w_less_c, year_category
+```
+
+```bash
+# Full refresh into quest_analytics.main_wcc_json
+python main_wcc_json_v2.py
+
+# Dry run only
+python main_wcc_json_v2.py --dry-run
+
+# Test one user
+python main_wcc_json_v2.py --user-id <tlo_user_id> --output csv
+
+# Write CSV and DB
+python main_wcc_json_v2.py --output both
+```
+
+Search inside the JSON table with MySQL:
+
+```sql
+SELECT DISTINCT u.*
+FROM quest_analytics.main_wcc_json u
+JOIN JSON_TABLE(
+    u.project_phase_combos,
+    '$[*]' COLUMNS (
+        proj_name VARCHAR(255) PATH '$.proj_name',
+        phase     VARCHAR(255) PATH '$.phase'
+    )
+) jt
+WHERE jt.proj_name = 'Project A'
+  AND jt.phase = 'Phase 1';
+```
+
 ### All Users — Full Refresh
 
 ```bash
