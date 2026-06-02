@@ -318,14 +318,19 @@ class TableCache:
     @staticmethod
     def _sanitize(df: pd.DataFrame) -> pd.DataFrame:
         """
-        Replace MySQL zero dates (0000-00-00 00:00:00) with None before
-        loading into DuckDB.  MySQL allows zero dates; DuckDB rejects them
-        with "timestamp field value out of range".
+        Replace MySQL zero dates and convert datetime-like object columns to
+        proper datetime64 dtype before loading into DuckDB.
 
-        Handles three forms pymysql may return:
-          - String  '0000-00-00 00:00:00'
-          - datetime.datetime(1, 1, 1, 0, 0)  (min Python datetime)
-          - pandas NaT already converted by the driver (safe — ignored)
+        Two problems solved:
+        1. DuckDB rejects MySQL zero dates (0000-00-00 00:00:00) with
+           "timestamp field value out of range".
+        2. After replacing zero dates with None, a column mixing
+           datetime.datetime objects with float NaN causes pandas .max()
+           to raise '>=' not supported between datetime.datetime and float.
+
+        Fix: replace zero dates, then convert any object column that contains
+        datetime objects to datetime64 via pd.to_datetime(errors='coerce').
+        NaT becomes the uniform null sentinel — safe for DuckDB and pandas.
         """
         import datetime as _dt
         _ZERO_STR = "0000-00-00 00:00:00"
@@ -333,18 +338,32 @@ class TableCache:
 
         for col in df.columns:
             if df[col].dtype == object:
+                # Step 1: replace zero-date strings with None
                 df[col] = df[col].replace(_ZERO_STR, None)
+
+                # Step 2: if column holds datetime objects, convert to
+                # datetime64 so .max() and DuckDB both work correctly
+                non_null = df[col].dropna()
+                if not non_null.empty and isinstance(non_null.iloc[0], _dt.datetime):
+                    df[col] = pd.to_datetime(df[col], errors="coerce")
+
             elif pd.api.types.is_datetime64_any_dtype(df[col]):
-                # NaT is already valid for DuckDB — nothing to do
+                # Already proper dtype — NaT is safe for DuckDB
                 pass
+
             else:
-                # Scalar datetime objects stored in object-dtype column after
-                # mixed-type inference — replace the sentinel value
-                mask = df[col].apply(
-                    lambda v: isinstance(v, _dt.datetime) and v == _ZERO_DT
-                )
-                if mask.any():
-                    df[col] = df[col].where(~mask, None)
+                # Edge case: non-object column holding datetime sentinel objects
+                try:
+                    mask = df[col].apply(
+                        lambda v: isinstance(v, _dt.datetime) and v == _ZERO_DT
+                    )
+                    if mask.any():
+                        df[col] = pd.to_datetime(
+                            df[col].where(~mask, pd.NaT), errors="coerce"
+                        )
+                except Exception:
+                    pass
+
         return df
 
     @staticmethod
