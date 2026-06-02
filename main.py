@@ -379,9 +379,8 @@ def run(
     _cache_eligible = not _scoped and not since and not force_refresh
 
     cache: AllocationCache | None = None
-    _alloc_from_cache   = False
-    _cache_total_rows   = 0
-    _cache_initialised  = False
+    _alloc_from_cache = False
+    _cache_total_rows = 0
 
     # fetch_fn is passed to s1 + s2 so they query DuckDB instead of MySQL.
     # None means fall back to the normal db.fetch (production MySQL).
@@ -510,9 +509,6 @@ def run(
             log.info("[cache] Chunk %d allocation → %s (caching result for next run)", chunk_idx, src)
             # Populate the cache while we go, so subsequent runs can use it.
             if cache is not None and not alloc.empty:
-                if not _cache_initialised:
-                    cache.init_table(alloc)
-                    _cache_initialised = True
                 cache.append(alloc)
                 _cache_total_rows += len(alloc)
         alloc_filtered = _apply_lesson_type_filter(alloc) if not alloc.empty else alloc

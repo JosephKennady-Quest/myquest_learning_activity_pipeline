@@ -188,17 +188,21 @@ class AllocationCache:
         self._con.execute("DELETE FROM cache_meta WHERE key = 'allocation_total_rows'")
         log.info("[cache] Allocation cache cleared — will rebuild this run")
 
-    def init_table(self, sample_df: pd.DataFrame):
-        """Create allocation_cache with the correct schema (no rows) from sample_df."""
-        self._con.register("_sample", sample_df.head(0))
-        self._con.execute("CREATE TABLE allocation_cache AS SELECT * FROM _sample")
-        self._con.unregister("_sample")
-        log.info("[cache] allocation_cache table created")
-
     def append(self, df: pd.DataFrame):
-        """Append one chunk of allocation data to the cache."""
+        """
+        Append one chunk of allocation data to the cache.
+        Creates the table on the first call (using real data for type inference).
+        Empty DataFrame head(0) was causing DuckDB to infer UUID columns as INT32.
+        """
         self._con.register("_chunk", df)
-        self._con.execute("INSERT INTO allocation_cache SELECT * FROM _chunk")
+        exists = self._con.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'allocation_cache'"
+        ).fetchone()[0]
+        if not exists:
+            self._con.execute("CREATE TABLE allocation_cache AS SELECT * FROM _chunk")
+            log.info("[cache] allocation_cache table created from first chunk")
+        else:
+            self._con.execute("INSERT INTO allocation_cache SELECT * FROM _chunk")
         self._con.unregister("_chunk")
 
     def finalise(self, total_rows: int):
