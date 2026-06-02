@@ -314,6 +314,38 @@ class TableCache:
         except Exception:
             return False
 
+    @staticmethod
+    def _sanitize(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Replace MySQL zero dates (0000-00-00 00:00:00) with None before
+        loading into DuckDB.  MySQL allows zero dates; DuckDB rejects them
+        with "timestamp field value out of range".
+
+        Handles three forms pymysql may return:
+          - String  '0000-00-00 00:00:00'
+          - datetime.datetime(1, 1, 1, 0, 0)  (min Python datetime)
+          - pandas NaT already converted by the driver (safe — ignored)
+        """
+        import datetime as _dt
+        _ZERO_STR = "0000-00-00 00:00:00"
+        _ZERO_DT  = _dt.datetime(1, 1, 1, 0, 0)
+
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].replace(_ZERO_STR, None)
+            elif pd.api.types.is_datetime64_any_dtype(df[col]):
+                # NaT is already valid for DuckDB — nothing to do
+                pass
+            else:
+                # Scalar datetime objects stored in object-dtype column after
+                # mixed-type inference — replace the sentinel value
+                mask = df[col].apply(
+                    lambda v: isinstance(v, _dt.datetime) and v == _ZERO_DT
+                )
+                if mask.any():
+                    df[col] = df[col].where(~mask, None)
+        return df
+
     def refresh(self):
         """Fetch all source tables from production and store in DuckDB."""
         col_w = max(len(t) for t in SOURCE_CACHE_TABLES) + 2
@@ -323,7 +355,7 @@ class TableCache:
 
         for table in SOURCE_CACHE_TABLES:
             try:
-                df = fetch(SOURCE_DB, f"SELECT * FROM {table}", None)
+                df = self._sanitize(fetch(SOURCE_DB, f"SELECT * FROM {table}", None))
                 self._con.execute(f"DROP TABLE IF EXISTS {table}")
                 self._con.register("_tmp", df)
                 self._con.execute(f"CREATE TABLE {table} AS SELECT * FROM _tmp")
@@ -524,7 +556,7 @@ class TableCache:
                     log.info("[table_cache]   last cached completed_at : %s", last_ts)
                     log.info("[table_cache]   fetching records newer than that ...")
 
-                    df = fetch(SOURCE_DB, incr_sql, (last_ts,))
+                    df = self._sanitize(fetch(SOURCE_DB, incr_sql, (last_ts,)))
 
                     if df.empty:
                         log.info(
@@ -585,7 +617,7 @@ class TableCache:
                 for i, chunk in enumerate(chunks, 1):
                     placeholders = ", ".join(["%s"] * len(chunk))
                     sql = batch_sql.format(placeholders=placeholders)
-                    df  = fetch(SOURCE_DB, sql, tuple(chunk))
+                    df  = self._sanitize(fetch(SOURCE_DB, sql, tuple(chunk)))
 
                     if not df.empty:
                         self._con.register("_tmp", df)
