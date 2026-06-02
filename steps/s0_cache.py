@@ -84,34 +84,60 @@ class AllocationCache:
         Return True if any watch table row count differs from the last snapshot,
         or if no snapshot exists yet. A single COUNT(*) per table over SSH —
         much cheaper than fetching the full allocation.
+
+        Logs a clear per-table status line so you can see exactly which tables
+        were checked, their current row counts, and whether each hit the cache
+        or detected a change.
         """
         existing = self._con.execute(
-            "SELECT table_name, row_count FROM allocation_row_counts"
+            "SELECT table_name, row_count, snapped_at FROM allocation_row_counts"
         ).fetchdf()
 
         if existing.empty:
-            log.info("[cache] No snapshot found — will fetch allocation live and cache it")
+            log.info("[cache] ── Cache status: NO SNAPSHOT FOUND ──────────────────────")
+            log.info("[cache] First run — allocation will be fetched live and cached")
+            log.info("[cache] ─────────────────────────────────────────────────────────")
             return True
 
-        snapshot = dict(zip(existing["table_name"], existing["row_count"]))
+        snapshot    = dict(zip(existing["table_name"], existing["row_count"]))
+        snapped_at  = existing.set_index("table_name")["snapped_at"].to_dict()
+        changed     = False
+        changed_tbl = None
+
+        log.info("[cache] ── Cache status: checking allocation tables ──────────────")
+        col_w = max(len(t) for t in ALLOCATION_WATCH_TABLES) + 2
 
         for table in ALLOCATION_WATCH_TABLES:
             try:
                 row     = fetch(SOURCE_DB, f"SELECT COUNT(*) AS cnt FROM {table}", None)
                 current = int(row["cnt"].iloc[0])
                 stored  = snapshot.get(table)
+                snapped = snapped_at.get(table, "unknown")
+
                 if stored is None or current != stored:
                     log.info(
-                        "[cache] Allocation table changed: %s (stored=%s, current=%d) — full refresh needed",
-                        table, stored, current,
+                        "[cache]   %-*s  CHANGED   stored=%-8s  current=%-8d  (snapped: %s)",
+                        col_w, table, stored, current, snapped,
                     )
-                    return True
+                    if not changed:
+                        changed_tbl = table
+                    changed = True
+                else:
+                    log.info(
+                        "[cache]   %-*s  ok        rows=%-8d               (snapped: %s)",
+                        col_w, table, current, snapped,
+                    )
             except Exception as exc:
-                log.warning("[cache] Could not check %s: %s — treating as changed", table, exc)
-                return True
+                log.warning("[cache]   %-*s  ERROR     %s — treating as changed", col_w, table, exc)
+                changed     = True
+                changed_tbl = table
 
-        log.info("[cache] All allocation tables unchanged — using local cache")
-        return False
+        if changed:
+            log.info("[cache] ── Result: CHANGED (trigger: %s) — full allocation refresh ─", changed_tbl)
+        else:
+            log.info("[cache] ── Result: ALL CACHED  ✓ — allocation will load from DuckDB ─")
+        log.info("[cache] ─────────────────────────────────────────────────────────")
+        return changed
 
     def save_row_count_snapshot(self):
         """Snapshot current row counts of all watch tables."""

@@ -469,6 +469,7 @@ def run(
             # Load from local DuckDB — no SSH connection needed for allocation.
             try:
                 alloc = cache.load_chunk(chunk_ids)
+                log.info("[cache] Chunk %d allocation → DuckDB (%d rows)", chunk_idx, len(alloc))
             except Exception as exc:
                 log.warning("[cache] Cache read failed (%s) — falling back to live query", exc)
                 alloc = fetch_allocation(
@@ -477,6 +478,7 @@ def run(
                     subject_id=subject_id, trade_id=trade_id,
                     paths=alloc_paths,
                 )
+                log.info("[cache] Chunk %d allocation → production (cache fallback)", chunk_idx)
         else:
             alloc = fetch_allocation(
                 user_ids=chunk_ids,
@@ -484,6 +486,7 @@ def run(
                 subject_id=subject_id, trade_id=trade_id,
                 paths=alloc_paths,
             )
+            log.info("[cache] Chunk %d allocation → production (caching for next run)", chunk_idx)
             # Populate the cache while we go, so subsequent runs can use it.
             if cache is not None and not alloc.empty:
                 if not _cache_initialised:
