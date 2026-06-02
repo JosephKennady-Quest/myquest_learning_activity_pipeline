@@ -1213,13 +1213,16 @@ If any table changed:
 
 | Scenario | Command |
 |---|---|
-| First time setup | `python main.py --force-refresh` |
-| Normal daily run | `python main.py` (incremental by default) |
-| Allocation tables changed | `python main.py` (auto-detected, cache rebuilt) |
-| Force full cache rebuild | `python main.py --force-refresh` |
-| Cache file corrupted | Delete `cache.duckdb`, then `python main.py --force-refresh` |
+| First time on a new server | `python3 main.py --force-refresh` |
+| Normal daily run | `python3 main.py` (incremental by default) |
+| Allocation tables changed | `python3 main.py` (auto-detected, full rebuild triggered) |
+| Force full cache rebuild | `python3 main.py --force-refresh` |
+| Update cache manually | `python3 main.py --force-refresh` |
+| Cache file corrupted | `rm cache.duckdb` then `python3 main.py --force-refresh` |
 
-> **`cache.duckdb` is gitignored** — it is never committed. Each server maintains its own local cache file. On a new server, simply run `python main.py --force-refresh` to build the cache from scratch.
+> **`cache.duckdb` is gitignored** — it is never committed. Each server maintains its own local cache file. On a new server, run `python3 main.py --force-refresh` to build the cache from scratch.
+
+> **`--force-refresh` rebuilds everything** — source tables, completion tables (full batch), and allocation result cache. Normal runs (`python3 main.py`) use incremental refresh for completion tables and skip source table re-download if nothing changed.
 
 ---
 

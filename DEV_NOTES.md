@@ -23,21 +23,112 @@ Output: DB tables in `quest_ple_analytics` (default) and/or CSV files.
 
 ---
 
+## Session Notes
+
+---
+
+### 2026-06-03 — DuckDB Cache Layer + Bug Fixes
+
+**What was built this session:**
+
+#### 1. Local DuckDB Cache (`steps/s0_cache.py`)
+
+Two-class cache layer that eliminates ~6,600 SSH connections per run down to ~9.
+
+**`TableCache`** — caches individual source tables from `quest_rearch_production`:
+- Tables: `users`, `student_details`, `subjects`, `lessons`, `lesson_types`, `trades`, `centre_subject`, `batch_subject`, `subject_trade`, `ple_career_paths`, `subject_ple_career_path`, `ple_career_path_user`
+- `make_fetch_fn()` returns a DuckDB-backed drop-in for `db.fetch()` — auto-adapts `%s→?` and backtick→double-quote
+- `is_fresh()` checks both metadata AND actual table existence in DuckDB (see bug fix #17 below)
+- `refresh_completion_tables(incremental=True, batch_size=5000)`:
+  - **Full refresh**: fetches `learning_activities` + `facilitator_learning_activities` in batches of 5,000 user_ids; filters to active users × active lessons × `completed=1`; stores `MAX(completed_at)` in `cache_meta`
+  - **Incremental**: fetches only `WHERE completed_at > last_cached_ts`, appends to existing table, updates max_ts; skips if no new records
+
+**`AllocationCache`** — caches the full allocation result per chunk:
+- `allocation_changed()`: runs COUNT(*) on 8 watch tables, compares against snapshot — detects any allocation table change
+- On each chunk: `append(df)` saves allocation result to `allocation_cache` in DuckDB
+- On unchanged runs: `load_chunk(user_ids)` loads directly from DuckDB — skips even local JOIN queries
+
+**SSH connections per run (before → after):**
+| Step | Before | After |
+|---|---|---|
+| s1 users | 1 | 0 (DuckDB) |
+| s2 allocation | ~4,410 | 0 (DuckDB) |
+| s3 completion | ~2,205 | 1 upfront only |
+| Change detection | 0 | 8 COUNT(*) |
+| **Total** | **~6,616** | **~9** |
+
+#### 2. `s1_users.py`, `s2_allocation.py`, `s3_completion.py` — `fetch_fn=None` parameter
+
+All three steps accept an optional `fetch_fn` parameter. When passed (from `TableCache.make_fetch_fn()`), they query DuckDB instead of MySQL. When not passed, behaviour is completely unchanged (falls back to `db.fetch`). No logic changes to any existing step.
+
+#### 3. `config.py` — chunk sizes increased
+- `ALLOC_CHUNK_SIZE`: 500 → 2000
+- `STAFF_ALLOC_CHUNK_SIZE`: 100 → 200
+
+#### 4. `main_wcc_json_v2.py` + `steps/s4_users_project_phase_json.py` — new Step 4
+
+One-row-per-user JSON output table (`quest_analytics.main_wcc_json`):
+- Source: `main_users` LEFT JOIN `main_centre_project` LEFT JOIN `main_phases`
+- Two JSON columns: `project_phase_combos` (prog, project, phase per user) and `subject_combos` (subject completion stats per user)
+- Separate CLI: `python3 main_wcc_json_v2.py`
+
+---
+
+**Bugs fixed this session:**
+
+#### Bug 16 — `TypeError: Expected numeric dtype, got object` in `_build_subject_agg`
+- `avg_score`/`avg_rating`/`avg_duration` columns arrive as `object` dtype when all values in a chunk are NULL
+- Fix: `pd.to_numeric(..., errors="coerce")` before `.round(2)`
+
+#### Bug 17 — `_cache_eligible` excluded `--force-refresh`, so cache was never built
+- `_cache_eligible = not _scoped and not since and not force_refresh` — when `--force-refresh` was passed, the entire cache block was skipped, meaning `cache.duckdb` was never populated
+- Fix: removed `force_refresh` from `_cache_eligible`; `force_refresh` now only controls whether to reuse existing data, not whether to enter the cache block
+
+#### Bug 18 — `is_fresh()` checked metadata only, not actual DuckDB tables
+- A partial/interrupted first run could save metadata then fail — next run saw metadata, returned `is_fresh()=True`, and tried to query tables that didn't exist
+- Fix: `is_fresh()` now also checks `information_schema.tables` to verify every source table actually exists in DuckDB
+
+#### Bug 19 — DuckDB `ConversionException: Could not convert string to INT32` on `allocation_cache`
+- `init_table()` created the schema from `sample_df.head(0)` (zero rows) — DuckDB inferred UUID columns as INT32 since there was no data to infer string type from
+- Fix: merged `init_table` into `append()`; table is now created from actual data on first call so types are inferred correctly
+
+---
+
+**How to run — cache lifecycle:**
+
+```bash
+# First time on a new server (or to fully rebuild cache):
+python3 main.py --force-refresh
+
+# Every run after (incremental learning_activities, DuckDB for everything else):
+python3 main.py
+
+# Cache file corrupted — delete and rebuild:
+rm cache.duckdb
+python3 main.py --force-refresh
+```
+
+---
+
 ## Current Status — What Is Done
 
 | File | Status | Notes |
 |---|---|---|
-| `config.py` | Done | Loads `.env`; `LEARNER_TYPES (3,4)`, `STAFF_TYPES (1,2)`, `ALL_TYPES (1,2,3,4)`, `ALLOC_CHUNK_SIZE=2000`, `STAFF_ALLOC_CHUNK_SIZE=200` |
-| `db.py` | Done | Custom SSH tunnel (paramiko, no sshtunnel); fetch / write_table / delete_user_rows helpers |
+| `config.py` | Done | Loads `.env`; `ALLOC_CHUNK_SIZE=2000`, `STAFF_ALLOC_CHUNK_SIZE=200` |
+| `db.py` | Done | Custom SSH tunnel (paramiko); fetch / write_table / delete_user_rows |
+| `steps/s0_cache.py` | Done | `TableCache` (source + completion tables) + `AllocationCache` (result cache); incremental refresh for learning_activities |
 | `steps/s0_changed_users.py` | Done | Incremental mode: finds user_ids with new completions since a timestamp |
-| `steps/s1_users.py` | Done | Fetches all active users types 1–4; LEFT JOIN student_details; supports user_id, centre_id, batch_id, trade_id filters |
-| `steps/s2_allocation.py` | Done | Three paths: non_ple, ple, staff; optional batch/trade intersection; `paths` param; `_concat()` helper |
-| `steps/s3_completion.py` | Done | Routes to correct table by user_type; `WHERE completed = 1`; subject counts; zero-completion stubs; auto-refetch on empty completion |
-| `main.py` | Done | All flags wired; learner/staff separate chunks; three DB tables; `--output db` default; CSV gated on `--output csv/both` |
-| `README.md` | Done | Full technical documentation — updated this session |
+| `steps/s1_users.py` | Done | Fetches all active users types 1–4; `fetch_fn=None` for DuckDB |
+| `steps/s2_allocation.py` | Done | Three paths: non_ple, ple, staff; `fetch_fn=None` threaded through all functions |
+| `steps/s3_completion.py` | Done | Routes by user_type; `fetch_fn=None` for DuckDB; zero-completion stubs |
+| `steps/s4_users_project_phase_json.py` | Done | One-row-per-user JSON builder for `main_wcc_json` |
+| `main.py` | Done | All flags including `--force-refresh`; cache layer wired; learner/staff separate chunks |
+| `main_wcc_json_v2.py` | Done | CLI for Step 4 JSON output |
+| `cache.duckdb` | Runtime | Auto-created on first run; gitignored; rebuild with `--force-refresh` |
+| `README.md` | Done | Full technical documentation including DuckDB cache section |
 | `DEV_NOTES.md` | This file | Development log |
 
-**Pipeline runs successfully.** All three DB tables written on every run.
+**Pipeline runs successfully.** All three DB tables written on every run. DuckDB cache reduces SSH connections from ~6,616 to ~9 per run.
 
 ---
 
@@ -368,17 +459,28 @@ After loop:
 | RDS Host | `SOURCE_RDS_HOST` (see `.env`) | `DEST_RDS_HOST` (see `.env`) |
 | DB Name | `quest_rearch_production` | `quest_ple_analytics` |
 
-### First-Run Setup
+### First-Run Setup (Updated)
 
 ```bash
-cd "AEL V2/ael_v2_pipeline"
-python3 -m venv venv
-source venv/bin/activate
+# 1. Pull code
+git pull origin main
+
+# 2. Install dependencies (includes duckdb)
 pip install -r requirements.txt
+
+# 3. Set up credentials
 cp .env.example .env
-# fill in SOURCE_DB_PASSWORD and DEST_DB_PASSWORD
-# copy .pem files into DB_Config/
-python main.py --user-id <test-user-uuid> --output csv --dry-run
+nano .env   # fill in SOURCE_DB_PASSWORD and DEST_DB_PASSWORD
+
+# 4. Copy .pem files into DB_Config/ (run on your Mac)
+scp -i /path/to/server-key.pem DB_Config/*.pem joseph@<server-ip>:.../DB_Config/
+chmod 400 DB_Config/*.pem
+
+# 5. First run — builds full DuckDB cache + runs pipeline
+python3 main.py --force-refresh
+
+# 6. Every run after
+python3 main.py
 ```
 
 ---
