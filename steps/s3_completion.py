@@ -54,38 +54,41 @@ GROUP BY user_id, lesson_id
 """
 
 
-def _fetch_from(table: str, user_ids: List[str]) -> pd.DataFrame:
+def _fetch_from(table: str, user_ids: List[str], fetch_fn=None) -> pd.DataFrame:
     """Run the completion query for a specific list of user_ids."""
     if not user_ids:
         return pd.DataFrame(columns=["user_id", "lesson_id", "score", "rating", "data_from"])
     placeholders = ", ".join(["%s"] * len(user_ids))
     sql = _SQL.format(table=table, user_clause=f"AND user_id IN ({placeholders})")
-    return fetch(SOURCE_DB, sql, tuple(user_ids))
+    return (fetch_fn or fetch)(SOURCE_DB, sql, tuple(user_ids))
 
 
-def fetch_student_completion(user_ids: List[str]) -> pd.DataFrame:
+def fetch_student_completion(user_ids: List[str], fetch_fn=None) -> pd.DataFrame:
     """
     Completion for learners / alumni (user types 3, 4).
     Source: learning_activities
     """
-    df = _fetch_from("learning_activities", user_ids)
-    log.info("[s3_completion] learning_activities → %d rows", len(df))
+    src = "DuckDB cache" if fetch_fn else "production"
+    df  = _fetch_from("learning_activities", user_ids, fetch_fn=fetch_fn)
+    log.info("[s3_completion] learning_activities → %d rows  [%s]", len(df), src)
     return df
 
 
-def fetch_facilitator_completion(user_ids: List[str]) -> pd.DataFrame:
+def fetch_facilitator_completion(user_ids: List[str], fetch_fn=None) -> pd.DataFrame:
     """
     Completion for facilitators and all other non-learner user types.
     Source: facilitator_learning_activities
     """
-    df = _fetch_from("facilitator_learning_activities", user_ids)
-    log.info("[s3_completion] facilitator_learning_activities → %d rows", len(df))
+    src = "DuckDB cache" if fetch_fn else "production"
+    df  = _fetch_from("facilitator_learning_activities", user_ids, fetch_fn=fetch_fn)
+    log.info("[s3_completion] facilitator_learning_activities → %d rows  [%s]", len(df), src)
     return df
 
 
 def fetch_completion(
-    user_ids: List[str],
+    user_ids:   List[str],
     user_types: Optional[Set[int]] = None,
+    fetch_fn=None,
 ) -> pd.DataFrame:
     """
     Fetch completion records for the given user_ids, routing to the correct
@@ -110,10 +113,10 @@ def fetch_completion(
     other_types   = user_types - _LEARNER_TYPES          # facilitators etc.
 
     if learner_types:
-        frames.append(fetch_student_completion(user_ids))
+        frames.append(fetch_student_completion(user_ids, fetch_fn=fetch_fn))
 
     if other_types:
-        frames.append(fetch_facilitator_completion(user_ids))
+        frames.append(fetch_facilitator_completion(user_ids, fetch_fn=fetch_fn))
 
     if not frames:
         log.warning("[s3_completion] no user_types matched — returning empty DataFrame")
@@ -133,7 +136,7 @@ def fetch_completion(
     return combined
 
 
-def merge_completion(allocation: pd.DataFrame, completion: pd.DataFrame) -> pd.DataFrame:
+def merge_completion(allocation: pd.DataFrame, completion: pd.DataFrame, fetch_fn=None) -> pd.DataFrame:
     """
     LEFT JOIN completion data onto the allocation DataFrame.
 
@@ -161,7 +164,7 @@ def merge_completion(allocation: pd.DataFrame, completion: pd.DataFrame) -> pd.D
         user_ids   = allocation["user_id"].dropna().unique().tolist()
         log.info("[s3_completion] re-fetching completion for %d users, user_types=%s",
                  len(user_ids), user_types)
-        completion = fetch_completion(user_ids=user_ids, user_types=user_types)
+        completion = fetch_completion(user_ids=user_ids, user_types=user_types, fetch_fn=fetch_fn)
 
     completion_cols = completion[["user_id", "lesson_id", "score", "rating", "data_from", "duration"]].copy()
     completion_cols["_matched"] = 1

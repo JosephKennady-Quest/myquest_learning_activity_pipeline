@@ -399,8 +399,12 @@ def run(
         else:
             tbl.log_status()
 
+        # Refresh completion tables every run (live data — always re-fetched).
+        # After this, all three steps (s1, s2, s3) query DuckDB instead of MySQL.
+        tbl.refresh_completion_tables()
+
         fetch_fn = tbl.make_fetch_fn()
-        log.info("[table_cache] s1_users + s2_allocation will query DuckDB cache")
+        log.info("[table_cache] s1 + s2 + s3 will all query DuckDB cache this run")
 
         # ── Layer 2: allocation result cache ──────────────────────────────────
         if not alloc_changed and cache.is_ready() and not force_refresh:
@@ -539,12 +543,12 @@ def run(
             u_types = set(alloc["user_type"].dropna().astype(int).unique())
             a_ids   = alloc["user_id"].dropna().unique().tolist()
             log.info("Fetching completion for %d allocated users", len(a_ids))
-            compl  = fetch_completion(user_ids=a_ids, user_types=u_types)
-            result = merge_completion(alloc_filtered, compl)
+            compl  = fetch_completion(user_ids=a_ids, user_types=u_types, fetch_fn=fetch_fn)
+            result = merge_completion(alloc_filtered, compl, fetch_fn=fetch_fn)
             if all_lesson_types:
                 # Compute all-types output only when explicitly requested.
                 # Reuse completion data, so this adds no extra DB read.
-                result_all  = merge_completion(alloc, compl)
+                result_all  = merge_completion(alloc, compl, fetch_fn=fetch_fn)
                 subj_all_df = _build_subject_agg(result_all)
                 del result_all   # free lesson-level all-types immediately
             else:

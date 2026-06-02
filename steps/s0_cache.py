@@ -339,6 +339,90 @@ class TableCache:
         except Exception as exc:
             log.warning("[table_cache] Could not read cache status: %s", exc)
 
+    # Filtered SQL for completion tables — only active users × active lessons,
+    # completed = 1 only (mirrors the WHERE clause in s3_completion._SQL).
+    _LA_SQL = """
+        SELECT la.*
+        FROM learning_activities la
+        WHERE la.completed = 1
+          AND la.user_id IN (
+              SELECT id FROM users
+              WHERE status = 1 AND deleted_at IS NULL AND type IN (3, 4)
+          )
+          AND la.lesson_id IN (
+              SELECT DISTINCT l.id
+              FROM centre_subject cs
+              LEFT JOIN lessons  l ON l.subject_id = cs.subject_id
+              LEFT JOIN subjects s ON s.id = cs.subject_id
+              WHERE l.id IS NOT NULL
+                AND s.status = 1 AND s.deleted_at IS NULL
+                AND l.status = 1 AND l.deleted_at IS NULL
+          )
+    """
+
+    _FLA_SQL = """
+        SELECT fla.*
+        FROM facilitator_learning_activities fla
+        WHERE fla.completed = 1
+          AND fla.user_id IN (
+              SELECT id FROM users
+              WHERE status = 1 AND deleted_at IS NULL AND type IN (1, 2)
+          )
+          AND fla.lesson_id IN (
+              SELECT DISTINCT l.id
+              FROM centre_subject cs
+              LEFT JOIN lessons  l ON l.subject_id = cs.subject_id
+              LEFT JOIN subjects s ON s.id = cs.subject_id
+              WHERE l.id IS NOT NULL
+                AND s.status = 1 AND s.deleted_at IS NULL
+                AND l.status = 1 AND l.deleted_at IS NULL
+          )
+    """
+
+    def refresh_completion_tables(self):
+        """
+        Fetch filtered learning_activities and facilitator_learning_activities
+        from production and store in DuckDB.
+
+        Called once per run (completion data is live — always refreshed).
+        Filters applied at source:
+          • active users only  (status=1, deleted_at IS NULL, correct type)
+          • active lessons only (status=1, deleted_at IS NULL, in centre_subject)
+          • completed = 1 only (mirrors s3_completion SQL)
+
+        After this runs, s3_completion queries DuckDB instead of MySQL,
+        cutting ~2205 per-chunk SSH connections down to 1 upfront fetch.
+        """
+        col_w = len("facilitator_learning_activities") + 2
+        log.info("[table_cache] ── Caching completion tables from production ─────────")
+
+        for table, sql in [
+            ("learning_activities",             self._LA_SQL),
+            ("facilitator_learning_activities", self._FLA_SQL),
+        ]:
+            try:
+                log.info("[table_cache]   %-*s  fetching (filtered: active users × active lessons, completed=1) ...", col_w, table)
+                df = fetch(SOURCE_DB, sql, None)
+                self._con.execute(f"DROP TABLE IF EXISTS {table}")
+                self._con.register("_tmp", df)
+                self._con.execute(f"CREATE TABLE {table} AS SELECT * FROM _tmp")
+                self._con.unregister("_tmp")
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                self._con.execute("""
+                    INSERT INTO source_table_meta (table_name, row_count, cached_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT (table_name) DO UPDATE SET
+                        row_count = excluded.row_count,
+                        cached_at = excluded.cached_at
+                """, [table, len(df), now])
+                log.info("[table_cache]   %-*s  %10d rows  ✓ cached", col_w, table, len(df))
+            except Exception as exc:
+                log.error("[table_cache]   %-*s  ✗ FAILED: %s", col_w, table, exc)
+                raise
+
+        log.info("[table_cache] Completion tables cached — s3 will query DuckDB this run")
+        log.info("[table_cache] ─────────────────────────────────────────────────────")
+
     def make_fetch_fn(self):
         """
         Return a fetch function with the same signature as db.fetch() that
