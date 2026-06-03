@@ -771,3 +771,104 @@ class TableCache:
             return con.execute(adapted, list(params) if params else []).fetchdf()
 
         return _duckdb_fetch
+
+
+# ── Result buffer ─────────────────────────────────────────────────────────────
+
+class ResultBuffer:
+    """
+    Accumulates chunk results in DuckDB during the loop, then streams
+    everything to the analytics DB in one go at the end.
+
+    Why: each per-chunk write opens 2 SSH connections (one per table).
+    For 635 chunks that is ~1,270 SSH connections just for writes.
+    Buffering in DuckDB reduces that to a single bulk write at the end.
+
+    Active for full refresh runs only (start_chunk=1, no --since).
+    Falls back to per-chunk writes for --start-chunk resume and --since.
+
+    Streams from DuckDB → analytics in stream_chunk-row batches so the
+    full result never has to fit in memory at once.
+    """
+
+    _TABLES = {
+        "lesson":      "_rbuf_lesson",
+        "subject":     "_rbuf_subject",
+        "subject_all": "_rbuf_subject_all",
+    }
+
+    def __init__(self, con: duckdb.DuckDBPyConnection):
+        self._con     = con
+        self._created: set[str] = set()
+
+    def append(self, key: str, df: pd.DataFrame):
+        """Append one chunk's result to the DuckDB buffer table."""
+        if df.empty:
+            return
+        buf = self._TABLES[key]
+        self._con.register("_rbuf", df)
+        if buf not in self._created:
+            self._con.execute(f"DROP TABLE IF EXISTS {buf}")
+            self._con.execute(f"CREATE TABLE {buf} AS SELECT * FROM _rbuf")
+            self._created.add(buf)
+        else:
+            self._con.execute(f"INSERT INTO {buf} SELECT * FROM _rbuf")
+        self._con.unregister("_rbuf")
+
+    def row_count(self, key: str) -> int:
+        buf = self._TABLES[key]
+        if buf not in self._created:
+            return 0
+        return self._con.execute(f"SELECT COUNT(*) FROM {buf}").fetchone()[0]
+
+    def flush(
+        self,
+        key:             str,
+        analytics_cfg:   dict,
+        analytics_table: str,
+        if_exists:       str = "replace",
+        stream_chunk:    int = 100_000,
+    ) -> int:
+        """
+        Stream rows from DuckDB buffer → analytics DB table.
+        Uses fetchmany() so only stream_chunk rows are in memory at once.
+        """
+        from db import write_table as _write_table
+
+        buf = self._TABLES[key]
+        if buf not in self._created:
+            log.info("[result_buf] %s — nothing buffered, skipping", analytics_table)
+            return 0
+
+        total = self._con.execute(f"SELECT COUNT(*) FROM {buf}").fetchone()[0]
+        log.info(
+            "[result_buf] flushing %-45s → %s  (%d rows in %d-row batches)",
+            buf, analytics_table, total, stream_chunk,
+        )
+
+        cursor  = self._con.execute(f"SELECT * FROM {buf}")
+        columns = [d[0] for d in cursor.description]
+        first   = True
+        written = 0
+
+        while True:
+            rows = cursor.fetchmany(stream_chunk)
+            if not rows:
+                break
+            df   = pd.DataFrame(rows, columns=columns)
+            mode = if_exists if first else "append"
+            _write_table(analytics_cfg, df, analytics_table, if_exists=mode)
+            first    = False
+            written += len(df)
+            log.info("[result_buf]   %s  %d / %d rows written", analytics_table, written, total)
+
+        self._con.execute(f"DROP TABLE IF EXISTS {buf}")
+        self._created.discard(buf)
+        log.info("[result_buf] ✓ %s complete — %d rows", analytics_table, written)
+        return written
+
+    def drop_all(self):
+        """Drop all buffer tables (cleanup on error or cancellation)."""
+        for buf in self._TABLES.values():
+            self._con.execute(f"DROP TABLE IF EXISTS {buf}")
+        self._created.clear()

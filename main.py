@@ -55,7 +55,7 @@ import pandas as pd
 
 from config import ANALYTICS_DB, ALLOC_CHUNK_SIZE, STAFF_ALLOC_CHUNK_SIZE, OUTPUT_DIR
 from db import delete_user_rows, write_table
-from steps.s0_cache import AllocationCache, TableCache
+from steps.s0_cache import AllocationCache, ResultBuffer, TableCache
 from steps.s0_changed_users import fetch_changed_user_ids
 from steps.s1_users import fetch_users
 from steps.s2_allocation import fetch_allocation
@@ -419,6 +419,21 @@ def run(
             cache.reset()
             log.info("[cache] Allocation result cache will be rebuilt this run")
 
+    # ── Result buffer ─────────────────────────────────────────────────────────
+    # Buffer chunk results in DuckDB, flush to analytics DB once at the end.
+    # Eliminates ~2 SSH write connections per chunk (saves ~95 min on 635 chunks).
+    # Only active for full unscoped runs starting from chunk 1.
+    # Falls back to per-chunk writes for --start-chunk resume and --since.
+    _use_result_buf = (
+        cache is not None          # DuckDB is active
+        and not since              # not incremental
+        and start_chunk == 1       # not resuming a partial run
+        and output in ("db", "both")
+    )
+    result_buf: ResultBuffer | None = ResultBuffer(cache._con) if _use_result_buf else None
+    if _use_result_buf:
+        log.info("[result_buf] Result buffering ON — analytics DB writes deferred to end of run")
+
     # ── Step 1: fetch users (lightweight — demographics only)
     users_df = fetch_users(user_id, centre_id, batch_id, trade_id, fetch_fn=fetch_fn)
     if users_df.empty:
@@ -605,15 +620,14 @@ def run(
             gc.collect()
             continue
 
-        # ── Write outputs ─────────────────────────────────────────────────────
-        # Full refresh  → replace on first chunk, append on the rest.
-        # Incremental   → delete this chunk's user rows then append.
+        # ── Write / buffer outputs ────────────────────────────────────────────
         subject_agg_df = _build_subject_agg(result)
 
         if output in ("db", "both"):
             if since:
-                delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_LESSON,     chunk_ids)
-                delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_SUBJECT,     chunk_ids)
+                # Incremental: per-chunk delete + insert (unchanged behaviour)
+                delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_LESSON,  chunk_ids)
+                delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_SUBJECT, chunk_ids)
                 if all_lesson_types:
                     delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_SUBJECT_ALL, chunk_ids)
                 db_write_mode     = "append"
@@ -627,26 +641,39 @@ def run(
                 _save_csv(result, user_id, centre_id, batch_id, subject_id, trade_id,
                           prefix="lessons_filtered")
             if output in ("db", "both"):
-                write_table(ANALYTICS_DB, result, OUTPUT_TABLE_LESSON, if_exists=db_write_mode)
-                log.info("DB written → %s  (chunk %d/%d, mode=%s)",
-                         OUTPUT_TABLE_LESSON, chunk_idx, n_chunks, db_write_mode)
+                if result_buf:
+                    result_buf.append("lesson", result)
+                    log.info("[result_buf] Chunk %d buffered → lesson  (%d rows, total: %d)",
+                             chunk_idx, len(result), result_buf.row_count("lesson"))
+                else:
+                    write_table(ANALYTICS_DB, result, OUTPUT_TABLE_LESSON, if_exists=db_write_mode)
+                    log.info("DB written → %s  (chunk %d/%d, mode=%s)",
+                             OUTPUT_TABLE_LESSON, chunk_idx, n_chunks, db_write_mode)
 
         if "subject" in active:
             if output in ("csv", "both"):
                 _save_csv(subject_agg_df, user_id, centre_id, batch_id, subject_id, trade_id,
                           prefix="subjects_filtered")
             if output in ("db", "both"):
-                write_table(ANALYTICS_DB, subject_agg_df, OUTPUT_TABLE_SUBJECT,
-                            if_exists=db_write_mode)
-                log.info("DB written → %s  (chunk %d/%d, mode=%s)",
-                         OUTPUT_TABLE_SUBJECT, chunk_idx, n_chunks, db_write_mode)
+                if result_buf:
+                    result_buf.append("subject", subject_agg_df)
+                    log.info("[result_buf] Chunk %d buffered → subject  (%d rows, total: %d)",
+                             chunk_idx, len(subject_agg_df), result_buf.row_count("subject"))
+                else:
+                    write_table(ANALYTICS_DB, subject_agg_df, OUTPUT_TABLE_SUBJECT,
+                                if_exists=db_write_mode)
+                    log.info("DB written → %s  (chunk %d/%d, mode=%s)",
+                             OUTPUT_TABLE_SUBJECT, chunk_idx, n_chunks, db_write_mode)
 
-            # All-lesson-types subject table — written only when requested.
+            # All-lesson-types subject table
             if all_lesson_types and output in ("db", "both") and not subj_all_df.empty:
-                write_table(ANALYTICS_DB, subj_all_df, OUTPUT_TABLE_SUBJECT_ALL,
-                            if_exists=db_write_mode_all)
-                log.info("DB written → %s  (chunk %d/%d, mode=%s)",
-                         OUTPUT_TABLE_SUBJECT_ALL, chunk_idx, n_chunks, db_write_mode_all)
+                if result_buf:
+                    result_buf.append("subject_all", subj_all_df)
+                else:
+                    write_table(ANALYTICS_DB, subj_all_df, OUTPUT_TABLE_SUBJECT_ALL,
+                                if_exists=db_write_mode_all)
+                    log.info("DB written → %s  (chunk %d/%d, mode=%s)",
+                             OUTPUT_TABLE_SUBJECT_ALL, chunk_idx, n_chunks, db_write_mode_all)
 
             # Accumulate all-types subject rows for CSV on small runs only
             if all_type_subj_frames is not None and not subj_all_df.empty:
@@ -658,6 +685,18 @@ def run(
         # ── Release memory before next chunk ─────────────────────────────────
         del alloc, alloc_filtered, compl, result, subject_agg_df, subj_all_df
         gc.collect()
+
+    # ── Flush result buffer to analytics DB (one bulk write) ─────────────────
+    if result_buf is not None and not dry_run:
+        log.info("[result_buf] ── Flushing all buffered results to analytics DB ──────")
+        if "lesson" in active:
+            result_buf.flush("lesson", ANALYTICS_DB, OUTPUT_TABLE_LESSON, if_exists="replace")
+        if "subject" in active:
+            result_buf.flush("subject", ANALYTICS_DB, OUTPUT_TABLE_SUBJECT, if_exists="replace")
+            if all_lesson_types:
+                result_buf.flush("subject_all", ANALYTICS_DB, OUTPUT_TABLE_SUBJECT_ALL,
+                                 if_exists="replace")
+        log.info("[result_buf] ── Flush complete ────────────────────────────────────")
 
     # ── Finalise allocation cache (only when we just rebuilt it) ─────────────
     if cache is not None:
