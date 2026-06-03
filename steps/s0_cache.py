@@ -472,20 +472,16 @@ class TableCache:
             log.warning("[table_cache] Could not read cache status: %s", exc)
 
     # ── Full-refresh batch SQL (user_id chunks) ───────────────────────────────
+    # Lesson-id filter removed from production queries — it ran as a subquery
+    # on EVERY batch (468 times), causing each batch to take 3+ minutes.
+    # The lesson filter is now applied ONCE in DuckDB after all batches load
+    # (see _apply_lesson_filter_in_duckdb), using the already-cached lessons,
+    # subjects, and centre_subject tables — fast local JOIN, zero SSH cost.
     _LA_BATCH_SQL = """
         SELECT la.*
         FROM learning_activities la
         WHERE la.completed = 1
           AND la.user_id IN ({placeholders})
-          AND la.lesson_id IN (
-              SELECT DISTINCT l.id
-              FROM centre_subject cs
-              LEFT JOIN lessons  l ON l.subject_id = cs.subject_id
-              LEFT JOIN subjects s ON s.id = cs.subject_id
-              WHERE l.id IS NOT NULL
-                AND s.status = 1 AND s.deleted_at IS NULL
-                AND l.status = 1 AND l.deleted_at IS NULL
-          )
     """
 
     _FLA_BATCH_SQL = """
@@ -493,20 +489,11 @@ class TableCache:
         FROM facilitator_learning_activities fla
         WHERE fla.completed = 1
           AND fla.user_id IN ({placeholders})
-          AND fla.lesson_id IN (
-              SELECT DISTINCT l.id
-              FROM centre_subject cs
-              LEFT JOIN lessons  l ON l.subject_id = cs.subject_id
-              LEFT JOIN subjects s ON s.id = cs.subject_id
-              WHERE l.id IS NOT NULL
-                AND s.status = 1 AND s.deleted_at IS NULL
-                AND l.status = 1 AND l.deleted_at IS NULL
-          )
     """
 
     # ── Incremental SQL (completed_at > last cached timestamp) ────────────────
-    # Fetches all new/updated completed records since last run — no user_id
-    # batching needed since the timestamp filter keeps the result set small.
+    # Lesson filter also moved to post-load DuckDB step (same reason).
+    # User filter kept here — limits result set to active users only.
     _LA_INCR_SQL = """
         SELECT la.*
         FROM learning_activities la
@@ -515,15 +502,6 @@ class TableCache:
           AND la.user_id IN (
               SELECT id FROM users
               WHERE status = 1 AND deleted_at IS NULL AND type IN (3, 4)
-          )
-          AND la.lesson_id IN (
-              SELECT DISTINCT l.id
-              FROM centre_subject cs
-              LEFT JOIN lessons  l ON l.subject_id = cs.subject_id
-              LEFT JOIN subjects s ON s.id = cs.subject_id
-              WHERE l.id IS NOT NULL
-                AND s.status = 1 AND s.deleted_at IS NULL
-                AND l.status = 1 AND l.deleted_at IS NULL
           )
     """
 
@@ -536,15 +514,22 @@ class TableCache:
               SELECT id FROM users
               WHERE status = 1 AND deleted_at IS NULL AND type IN (1, 2)
           )
-          AND fla.lesson_id IN (
-              SELECT DISTINCT l.id
-              FROM centre_subject cs
-              LEFT JOIN lessons  l ON l.subject_id = cs.subject_id
-              LEFT JOIN subjects s ON s.id = cs.subject_id
-              WHERE l.id IS NOT NULL
-                AND s.status = 1 AND s.deleted_at IS NULL
-                AND l.status = 1 AND l.deleted_at IS NULL
-          )
+    """
+
+    # ── DuckDB post-load lesson filter ────────────────────────────────────────
+    # Runs once after all batches are loaded, using locally cached tables.
+    # Removes any rows whose lesson_id is not an active lesson in centre_subject.
+    _LESSON_FILTER_SQL = """
+        DELETE FROM {table}
+        WHERE lesson_id NOT IN (
+            SELECT DISTINCT l.id
+            FROM   centre_subject cs
+            LEFT JOIN lessons  l ON l.subject_id = cs.subject_id
+            LEFT JOIN subjects s ON s.id          = cs.subject_id
+            WHERE  l.id IS NOT NULL
+              AND  s.status     = 1 AND s.deleted_at IS NULL
+              AND  l.status     = 1 AND l.deleted_at IS NULL
+        )
     """
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -585,6 +570,21 @@ class TableCache:
                 cached_at = excluded.cached_at
             """,
             [table, row_count, now],
+        )
+
+    def _apply_lesson_filter_in_duckdb(self, table: str):
+        """
+        Remove rows whose lesson_id is not an active lesson in centre_subject.
+        Runs once in DuckDB after all batches are loaded — uses already-cached
+        lessons, subjects, centre_subject tables (local, zero SSH cost).
+        """
+        before = self._con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        self._con.execute(self._LESSON_FILTER_SQL.format(table=table))
+        after  = self._con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        removed = before - after
+        log.info(
+            "[table_cache]   %-35s  lesson filter: removed %d inactive rows (%d → %d)",
+            table, removed, before, after,
         )
 
     # ── Public refresh method ─────────────────────────────────────────────────
@@ -725,6 +725,14 @@ class TableCache:
                         f"(user_id VARCHAR, lesson_id VARCHAR, score DOUBLE, "
                         f"rating DOUBLE, duration BIGINT, completed INTEGER)"
                     )
+
+                # Apply lesson filter once in DuckDB — uses cached tables,
+                # no SSH needed. Much faster than running subquery per batch.
+                if table_created:
+                    self._apply_lesson_filter_in_duckdb(table)
+                    total_rows = self._con.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
 
                 self._upsert_source_meta(table, total_rows)
 
