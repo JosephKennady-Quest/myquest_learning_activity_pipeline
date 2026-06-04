@@ -46,6 +46,27 @@ from db import fetch
 
 log = logging.getLogger(__name__)
 
+
+def _ensure_varchar_nulls(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Force all-NULL object columns to pandas StringDtype before registering
+    with DuckDB.
+
+    When a column is all-NULL, DuckDB infers it as INTEGER (INT32) because
+    NULL has no type information.  If a later chunk then inserts a UUID string
+    into that column, DuckDB raises:
+        ConversionError: Could not convert string '...' to INT32
+
+    Typing the column as pd.StringDtype() tells DuckDB to use VARCHAR instead,
+    which accepts NULLs and UUID strings equally.  Applied only when creating
+    a new table (first chunk) — subsequent INSERTs use the already-set schema.
+    """
+    df = df.copy()
+    for col in df.columns:
+        if df[col].dtype == object and df[col].isna().all():
+            df[col] = pd.array([pd.NA] * len(df), dtype=pd.StringDtype())
+    return df
+
 _PIPELINE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CACHE_PATH = os.path.join(_PIPELINE_DIR, "cache.duckdb")
 
@@ -195,14 +216,16 @@ class AllocationCache:
         Creates the table on the first call (using real data for type inference).
         Empty DataFrame head(0) was causing DuckDB to infer UUID columns as INT32.
         """
-        self._con.register("_chunk", df)
         exists = self._con.execute(
             "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'allocation_cache'"
         ).fetchone()[0]
         if not exists:
+            # Fix all-NULL object columns → VARCHAR before DuckDB infers INT32.
+            self._con.register("_chunk", _ensure_varchar_nulls(df))
             self._con.execute("CREATE TABLE allocation_cache AS SELECT * FROM _chunk")
             log.info("[cache] allocation_cache table created from first chunk")
         else:
+            self._con.register("_chunk", df)
             self._con.execute("INSERT INTO allocation_cache SELECT * FROM _chunk")
         self._con.unregister("_chunk")
 
@@ -806,12 +829,14 @@ class ResultBuffer:
         if df.empty:
             return
         buf = self._TABLES[key]
-        self._con.register("_rbuf", df)
         if buf not in self._created:
+            # Fix all-NULL object columns → VARCHAR before DuckDB infers INT32.
+            self._con.register("_rbuf", _ensure_varchar_nulls(df))
             self._con.execute(f"DROP TABLE IF EXISTS {buf}")
             self._con.execute(f"CREATE TABLE {buf} AS SELECT * FROM _rbuf")
             self._created.add(buf)
         else:
+            self._con.register("_rbuf", df)
             self._con.execute(f"INSERT INTO {buf} SELECT * FROM _rbuf")
         self._con.unregister("_rbuf")
 
