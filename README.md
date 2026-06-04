@@ -1069,35 +1069,44 @@ STAFF_ALLOC_CHUNK_SIZE = 200    # staff per allocation query (admins get many mo
 
 The pipeline uses a local DuckDB file (`cache.duckdb`) to cache source tables and allocation results. This eliminates the majority of SSH tunnel connections on every run — from ~6,600 connections down to ~9.
 
-| Without cache | With cache |
-|---|---|
-| s1 users: 1 SSH per run | 0 — reads from DuckDB |
-| s2 allocation: ~4,410 SSH (2 per chunk × 2205 chunks) | 0 — reads from DuckDB |
-| s3 completion: ~2,205 SSH (1 per chunk) | 1 — one upfront fetch, then DuckDB |
-| Allocation change check: 8 COUNT(*) | 8 COUNT(*) (always live) |
-| **Total ~6,616** | **~9** |
+| Step | No cache | Cache only | Cache + Result Buffer |
+|---|---|---|---|
+| s1 users | 1 | 0 (DuckDB) | 0 (DuckDB) |
+| s2 allocation | ~4,410 | 0 (DuckDB) | 0 (DuckDB) |
+| s3 completion | ~2,205 | 1 upfront | 1 upfront |
+| DB writes | ~1,270 | ~1,270 | 2 (bulk flush) |
+| Allocation change check | 0 | 8 COUNT(*) | 8 COUNT(*) |
+| **Total** | **~7,886** | **~1,280** | **~11** |
 
 The cache is only active for **full unscoped runs** (no `--user-id` / `--centre-id` / `--batch-id` / `--subject-id` / `--trade-id` filters, no `--since`). Scoped runs always use live production queries — they are fast and this keeps cache logic simple.
 
 ---
 
-### Two-Layer Cache Strategy
+### Three-Layer Cache + Result Buffer Strategy
 
 **Layer 1 — Source Table Cache (`TableCache`)**
 
 Caches individual source tables from `quest_rearch_production` into DuckDB. Once cached, `s1_users` and `s2_allocation` run their existing SQL queries locally against DuckDB using a drop-in fetch function.
 
-SQL adaptations applied automatically by the DuckDB fetch function:
+SQL adaptations applied automatically:
 - `%s` → `?` (placeholder style)
 - `` `identifier` `` → `"identifier"` (quoting style)
 
-**Layer 1b — Completion Table Cache (incremental)**
+**Layer 1b — Completion Table Cache (incremental, deduplicated)**
 
-`learning_activities` and `facilitator_learning_activities` are also cached — filtered to active users × active lessons × `completed = 1`. These are refreshed on every run using incremental logic (see below).
+`learning_activities` and `facilitator_learning_activities` are cached with filters applied at source (`completed = 1`, active users, active lessons). Refreshed every run:
+- **Full refresh** (`--force-refresh`): fetches in batches of 2,000 user IDs, applies lesson filter in DuckDB, then deduplicates to one row per `(user_id, lesson_id)` keeping the most recent `completed_at`
+- **Incremental** (default): fetches only `WHERE completed_at > last_cached_ts`, upserts (delete old + insert new) so duplicates never accumulate
 
 **Layer 2 — Allocation Result Cache (`AllocationCache`)**
 
-After `s2_allocation` runs (whether against DuckDB or MySQL), the full allocation result is saved chunk-by-chunk into `allocation_cache` in DuckDB. On subsequent runs where allocation is confirmed unchanged, each chunk's allocation is loaded directly from this result cache — skipping even the local DuckDB JOIN queries.
+After `s2_allocation` runs (against DuckDB), the full allocation result is saved chunk-by-chunk into `allocation_cache`. On subsequent runs where allocation is unchanged, each chunk loads directly from this result cache — skipping even the local DuckDB JOIN queries.
+
+**Result Buffer (`ResultBuffer`)**
+
+During the chunk loop, instead of opening 2 SSH connections per chunk to write to analytics DB, results are buffered in DuckDB (`_rbuf_lesson`, `_rbuf_subject`). After all chunks complete, a single bulk write streams everything to analytics DB via `fetchmany()` in 100k-row batches.
+
+Active for full unscoped runs (`start_chunk=1`, no `--since`). Falls back to per-chunk writes for `--start-chunk` resume and `--since` incremental.
 
 ---
 
@@ -1143,6 +1152,49 @@ After loading, `MAX(completed_at)` is stored in `cache_meta`.
 Only fetches records where `completed_at > last_cached_ts` and appends them to the existing DuckDB table. The `s3_completion` SQL already uses `MAX(score)` / `SUM(duration)` with `GROUP BY (user_id, lesson_id)`, so any duplicate keys from incremental appends are correctly aggregated at query time.
 
 If no new records exist since the last run, the table is left untouched and a log line confirms it.
+
+---
+
+### Completion Table Deduplication
+
+A user who retries a lesson creates multiple records in `learning_activities` with the same `(user_id, lesson_id)`. The cache always keeps exactly one row per pair — the most recent attempt (`MAX(completed_at)`).
+
+**Full refresh dedup** — runs once after all batches load:
+```sql
+-- Keeps the latest attempt per (user_id, lesson_id)
+SELECT * EXCLUDE (_rn) FROM (
+    SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY user_id, lesson_id
+        ORDER BY completed_at DESC NULLS LAST
+    ) AS _rn FROM learning_activities
+) WHERE _rn = 1
+```
+
+**Incremental upsert** — on every normal run:
+1. Fetch new records (`completed_at > last_cached_ts`)
+2. Deduplicate new batch itself (if same pair retried twice in the window)
+3. DELETE existing cache rows for all affected `(user_id, lesson_id)` pairs
+4. INSERT the latest record for each pair
+
+This prevents duplicate rows from accumulating in the cache across runs.
+
+**Apply dedup to existing cache without re-fetching:**
+```bash
+python3 -c "
+import duckdb; con = duckdb.connect('cache.duckdb')
+for t in ['learning_activities', 'facilitator_learning_activities']:
+    con.execute(f'''CREATE TABLE _d AS SELECT * EXCLUDE (_rn)
+        FROM (SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY user_id, lesson_id
+                ORDER BY completed_at DESC NULLS LAST) AS _rn
+              FROM {t}) WHERE _rn = 1''')
+    con.execute(f'DROP TABLE {t}')
+    con.execute(f'ALTER TABLE _d RENAME TO {t}')
+    n = con.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
+    print(f'{t}: {n:,} unique rows')
+con.close()
+"
+```
 
 ---
 

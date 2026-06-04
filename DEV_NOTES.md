@@ -27,6 +27,147 @@ Output: DB tables in `quest_ple_analytics` (default) and/or CSV files.
 
 ---
 
+### 2026-06-04 — Result Buffer + Deduplication + Multiple Bug Fixes
+
+**What was built this session:**
+
+#### 1. `ResultBuffer` class (`steps/s0_cache.py`)
+
+Eliminates ~1,270 SSH write connections per run by buffering all chunk results in DuckDB and flushing to analytics DB once at the end.
+
+- `append(key, df)` — accumulates chunk result in a DuckDB buffer table (`_rbuf_lesson`, `_rbuf_subject`, `_rbuf_subject_all`)
+- `flush(key, analytics_cfg, analytics_table, if_exists, stream_chunk=100_000)` — streams from DuckDB → analytics DB via `fetchmany()` in 100k-row batches (memory-safe for 50M+ rows)
+- `drop_all()` — cleanup on error
+
+Active for: full unscoped runs where `start_chunk == 1` and no `--since`.
+Inactive for: `--since` incremental, `--start-chunk` resume, scoped runs.
+
+**SSH connections per run (updated):**
+| Step | Before cache | After cache | After result buffer |
+|---|---|---|---|
+| s2 allocation | ~4,410 | 0 (DuckDB) | 0 (DuckDB) |
+| s3 completion | ~2,205 | 1 upfront | 1 upfront |
+| DB writes | ~1,270 | ~1,270 | 2 (bulk flush) |
+| **Total** | **~7,886** | **~1,280** | **~11** |
+
+#### 2. `learning_activities` deduplication
+
+Multiple attempts by the same user on the same lesson create duplicate `(user_id, lesson_id)` rows. Fixed at two levels:
+
+**Full refresh** — `_dedup_completion_table(table)` runs after batch load + lesson filter:
+```sql
+CREATE TABLE _dedup AS
+SELECT * EXCLUDE (_rn) FROM (
+    SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY user_id, lesson_id
+        ORDER BY completed_at DESC NULLS LAST
+    ) AS _rn FROM {table}
+) WHERE _rn = 1
+```
+Keeps only the most recent attempt per `(user_id, lesson_id)`.
+
+**Incremental** — changed from simple append to upsert:
+1. Deduplicate the new batch itself (if same pair appears twice in the incremental window)
+2. DELETE existing DuckDB rows for all affected `(user_id, lesson_id)` pairs
+3. INSERT the fresh (latest) records
+Ensures cache always has exactly one row per user × lesson.
+
+#### 3. Lesson filter moved from MySQL to DuckDB
+
+The `lesson_id IN (subquery)` was running against production on every batch (468 times), causing each batch to take 3+ minutes.
+
+Fix: batch SQL simplified to `WHERE completed=1 AND user_id IN (...)`. After all batches load, `_apply_lesson_filter_in_duckdb(table)` runs one DELETE using already-cached `lessons`, `subjects`, `centre_subject` tables — zero SSH, runs in milliseconds.
+
+#### 4. Retry logic for lost MySQL connections
+
+`_fetch_with_retry(sql, params, max_retries=3, base_wait=5.0)` wraps `db.fetch()` with exponential backoff on connection errors:
+- Attempt 1 fails → wait 5s → retry
+- Attempt 2 fails → wait 10s → retry
+- Attempt 3 fails → wait 20s → retry
+- Non-connection errors re-raised immediately
+
+#### 5. `_ensure_varchar_nulls(df)` — module-level helper
+
+All-NULL object columns get inferred as INT32 by DuckDB (no data to infer string type from). Applied before every `CREATE TABLE` call (first chunk/buffer only):
+```python
+for col in df.columns:
+    if df[col].dtype == object and df[col].isna().all():
+        df[col] = pd.array([pd.NA] * len(df), dtype=pd.StringDtype())
+```
+Used in both `AllocationCache.append()` and `ResultBuffer.append()`.
+
+#### 6. `TableCache._sanitize(df)` — expanded
+
+Originally only replaced zero-date strings. Now handles three MySQL → Python conversion problems:
+| MySQL type | pymysql returns | Problem | Fix |
+|---|---|---|---|
+| DATETIME zero date | `'0000-00-00 00:00:00'` string | DuckDB rejects timestamp | Replace with `None` |
+| DATETIME column | `datetime.datetime` objects | Mixed with float NaN → `.max()` TypeError | Convert to `datetime64` |
+| DECIMAL column | `decimal.Decimal` objects | DuckDB infers narrow `DECIMAL(p,s)` → overflow on later batches | Convert to `float64` |
+
+---
+
+**Bugs fixed this session:**
+
+#### Bug 20 — `_cache_eligible` excluded `--force-refresh`, cache never built
+- `_cache_eligible = not _scoped and not since and not force_refresh` — when `--force-refresh` passed, entire cache block skipped
+- Fix: removed `force_refresh` from `_cache_eligible`; it now only controls whether to reuse existing data
+
+#### Bug 21 — `is_fresh()` checked metadata only, not actual DuckDB tables
+- Partial/interrupted run could save metadata then fail — next run saw metadata, thought tables existed, tried to query missing tables
+- Fix: `is_fresh()` now also checks `information_schema.tables` for each source table
+
+#### Bug 22 — DuckDB timestamp error on MySQL zero dates
+- `0000-00-00 00:00:00` (valid in MySQL) rejected by DuckDB with "timestamp field value out of range"
+- Fix: `_sanitize()` replaces zero-date strings with `None` before DuckDB registration
+
+#### Bug 23 — `datetime.max()` TypeError after zero-date sanitization
+- After replacing zero dates with `None`, column mixed `datetime.datetime` + `float NaN` → pandas `.max()` raised `'>=' not supported`
+- Fix: `_sanitize()` detects datetime-object columns and converts to `datetime64` via `pd.to_datetime(errors='coerce')`
+
+#### Bug 24 — DuckDB `DECIMAL` overflow across batches
+- DuckDB inferred `DECIMAL(6,4)` from first batch (all values < 10). Later batch had `score=100.0` → overflow
+- Fix: `_sanitize()` detects `decimal.Decimal` objects and converts to `float64` → DuckDB uses `DOUBLE`
+
+#### Bug 25 — DuckDB `INT32` inference on all-NULL columns in allocation + result cache
+- `project_id` was all-NULL across 468 learner chunks → DuckDB inferred INT32. Staff chunk 469 had real UUID strings → cast failed
+- Fix: `_ensure_varchar_nulls(df)` forces all-NULL object columns to `pd.StringDtype()` before CREATE TABLE
+
+#### Bug 26 — Lost MySQL connection during `learning_activities` batch fetch
+- Large batch queries timed out mid-fetch due to MySQL `wait_timeout`
+- Fix: `_fetch_with_retry()` with 3 retries and exponential backoff (5s, 10s, 20s)
+
+#### Bug 27 — Slow batch fetch due to `lesson_id` subquery on every batch
+- `lesson_id IN (SELECT DISTINCT ... JOIN JOIN)` ran against production 468 times → 3+ min per batch
+- Fix: removed subquery from batch SQL; lesson filter applied once in DuckDB after all batches load
+
+---
+
+**How to run going forward:**
+
+```bash
+# Normal daily/weekly run (incremental, all from DuckDB)
+python3 main.py
+
+# Only needed when: allocation tables changed, new server, or cache corrupted
+python3 main.py --force-refresh
+
+# Apply dedup to existing cache without re-fetching (one-time fix)
+python3 -c "
+import duckdb; con = duckdb.connect('cache.duckdb')
+for t in ['learning_activities', 'facilitator_learning_activities']:
+    con.execute(f'CREATE TABLE _d AS SELECT * EXCLUDE (_rn) FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY user_id, lesson_id ORDER BY completed_at DESC NULLS LAST) AS _rn FROM {t}) WHERE _rn = 1')
+    con.execute(f'DROP TABLE {t}'); con.execute(f'ALTER TABLE _d RENAME TO {t}')
+    print(f'{t} deduped')
+con.close()
+"
+
+# After main pipeline completes
+python3 main_wcc_json_v2.py
+```
+
+---
+
 ### 2026-06-03 — DuckDB Cache Layer + Bug Fixes
 
 **What was built this session:**
@@ -116,7 +257,7 @@ python3 main.py --force-refresh
 |---|---|---|
 | `config.py` | Done | Loads `.env`; `ALLOC_CHUNK_SIZE=2000`, `STAFF_ALLOC_CHUNK_SIZE=200` |
 | `db.py` | Done | Custom SSH tunnel (paramiko); fetch / write_table / delete_user_rows |
-| `steps/s0_cache.py` | Done | `TableCache` (source + completion tables) + `AllocationCache` (result cache); incremental refresh for learning_activities |
+| `steps/s0_cache.py` | Done | `TableCache` + `AllocationCache` + `ResultBuffer`; incremental upsert for learning_activities; dedup by (user_id, lesson_id); retry logic; zero-date + DECIMAL + NULL-dtype sanitization |
 | `steps/s0_changed_users.py` | Done | Incremental mode: finds user_ids with new completions since a timestamp |
 | `steps/s1_users.py` | Done | Fetches all active users types 1–4; `fetch_fn=None` for DuckDB |
 | `steps/s2_allocation.py` | Done | Three paths: non_ple, ple, staff; `fetch_fn=None` threaded through all functions |
