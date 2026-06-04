@@ -557,6 +557,44 @@ class TableCache:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
+    def _dedup_completion_table(self, table: str):
+        """
+        Deduplicate to one row per (user_id, lesson_id) keeping the record
+        with the most recent completed_at.
+
+        A user who retries a lesson creates multiple records with the same
+        (user_id, lesson_id).  We keep only the latest attempt so the cache
+        has a clean unique key and queries run faster.
+
+        Uses ROW_NUMBER() OVER (PARTITION BY user_id, lesson_id
+                                ORDER BY completed_at DESC NULLS LAST) = 1
+        so no data is lost — just old attempts are dropped in favour of the
+        most recent one.
+        """
+        before = self._con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        self._con.execute(f"""
+            CREATE TABLE _dedup AS
+            SELECT * EXCLUDE (_rn)
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY user_id, lesson_id
+                           ORDER BY completed_at DESC NULLS LAST
+                       ) AS _rn
+                FROM {table}
+            )
+            WHERE _rn = 1
+        """)
+        self._con.execute(f"DROP TABLE {table}")
+        self._con.execute(f"ALTER TABLE _dedup RENAME TO {table}")
+        after   = self._con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        removed = before - after
+        log.info(
+            "[table_cache]   %-35s  dedup: %d → %d unique (user_id, lesson_id) rows"
+            "  (%d duplicate attempts removed)",
+            table, before, after, removed,
+        )
+
     def _get_last_completion_ts(self, table: str) -> str | None:
         """Return the stored MAX(completed_at) for a completion table, or None."""
         try:
@@ -662,6 +700,32 @@ class TableCache:
                         log.info("[table_cache] ─" * 30)
                         continue
 
+                    # Keep only the latest attempt per (user_id, lesson_id)
+                    # within the new batch itself before upserting.
+                    before_dedup = len(df)
+                    df = (
+                        df.sort_values("completed_at", ascending=False, na_position="last")
+                          .drop_duplicates(subset=["user_id", "lesson_id"], keep="first")
+                          .reset_index(drop=True)
+                    )
+                    if len(df) < before_dedup:
+                        log.info(
+                            "[table_cache]   %-*s  %d duplicate attempts in new batch removed",
+                            col_w, table, before_dedup - len(df),
+                        )
+
+                    # Upsert: delete existing rows for any (user_id, lesson_id)
+                    # that has a new record, then insert the fresh record.
+                    # This ensures the cache always holds the latest attempt only.
+                    self._con.register("_incr_pairs", df[["user_id", "lesson_id"]])
+                    deleted = self._con.execute(f"""
+                        DELETE FROM {table}
+                        WHERE (user_id, lesson_id) IN (
+                            SELECT user_id, lesson_id FROM _incr_pairs
+                        )
+                    """).fetchone()
+                    self._con.unregister("_incr_pairs")
+
                     self._con.register("_incr", df)
                     self._con.execute(f"INSERT INTO {table} SELECT * FROM _incr")
                     self._con.unregister("_incr")
@@ -669,15 +733,14 @@ class TableCache:
                     new_ts = str(df["completed_at"].max())
                     self._save_last_completion_ts(table, new_ts)
 
-                    # Update row count in meta
                     total = self._con.execute(
                         f"SELECT COUNT(*) FROM {table}"
                     ).fetchone()[0]
                     self._upsert_source_meta(table, total)
 
                     log.info(
-                        "[table_cache]   %-*s  +%d new rows appended  "
-                        "(total: %d)  new max_ts: %s",
+                        "[table_cache]   %-*s  upserted %d records  "
+                        "(total: %d unique user×lesson rows)  new max_ts: %s",
                         col_w, table, len(df), total, new_ts,
                     )
                     log.info("[table_cache] ─────────────────────────────────────────────────────")
@@ -753,6 +816,9 @@ class TableCache:
                 # no SSH needed. Much faster than running subquery per batch.
                 if table_created:
                     self._apply_lesson_filter_in_duckdb(table)
+                    # Deduplicate: keep only the latest attempt per
+                    # (user_id, lesson_id) so the cache has a unique key.
+                    self._dedup_completion_table(table)
                     total_rows = self._con.execute(
                         f"SELECT COUNT(*) FROM {table}"
                     ).fetchone()[0]
