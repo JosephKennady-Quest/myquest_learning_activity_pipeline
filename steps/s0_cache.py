@@ -35,6 +35,7 @@ Use --force-refresh to bypass both layers and rebuild from scratch.
 
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -843,6 +844,157 @@ class TableCache:
                 raise
 
         log.info("[table_cache] Completion tables ready — s3 will query DuckDB this run")
+
+    # ── Allocation pre-computation ────────────────────────────────────────────
+
+    _ORDER_BY_RE = re.compile(r'\s+ORDER\s+BY\b.*', re.IGNORECASE | re.DOTALL)
+
+    @staticmethod
+    def _adapt_sql_for_duckdb(sql: str) -> str:
+        """Convert MySQL SQL placeholders and identifier quoting to DuckDB style."""
+        return sql.replace("`", '"').replace("%s", "?")
+
+    def precompute_allocation(self, learner_types_sql: str) -> int:
+        """
+        Run the full allocation query for ALL users in one DuckDB pass and
+        store the combined deduplicated result as the _alloc_precomputed table.
+
+        Problem solved:
+          Previously, each of 469 learner chunks ran 2 complex 7-table JOINs
+          (non_ple + ple) against DuckDB, scanning batch_subject (1.8M rows)
+          and centre_subject (323K rows) 938 times total — ~10 hours wall time.
+
+        Fix:
+          Run each of the 3 allocation paths (non_ple, ple, staff) ONCE for all
+          users. Each is a CREATE TABLE AS in DuckDB — no chunking, no Python
+          memory pressure. Then combine + deduplicate in a single SQL step.
+          Each chunk then reads via:
+            SELECT * FROM _alloc_precomputed WHERE user_id IN (...)
+          which is a sub-second indexed scan on the already-materialised table.
+
+        Expected time: ~15–30 min (3 full-table JOINs) vs ~10 hours (938 JOINs).
+        Returns total row count of the pre-computed table.
+        """
+        from steps.s2_allocation import (
+            _NON_PLE_SQL, _PLE_SQL, _STAFF_SQL,
+            _COMMON_SELECT, _COMMON_SELECT_STAFF,
+            _LESSON_JOINS, _LESSON_JOINS_STAFF,
+        )
+
+        log.info("[table_cache] ── Pre-computing full allocation (all users, 1 pass) ──────")
+        t0 = time.time()
+
+        def _build(template, common_select, lesson_joins, types=""):
+            sql = template.format(
+                common_select=common_select,
+                lesson_joins=lesson_joins,
+                types=types,
+                user_clause="",       # no user filter — all users at once
+            )
+            sql = self._adapt_sql_for_duckdb(sql)
+            sql = self._ORDER_BY_RE.sub("", sql).strip()   # ORDER BY not needed here
+            return sql
+
+        non_ple_sql = _build(_NON_PLE_SQL, _COMMON_SELECT,       _LESSON_JOINS,       types=learner_types_sql)
+        ple_sql     = _build(_PLE_SQL,     _COMMON_SELECT,        _LESSON_JOINS,       types=learner_types_sql)
+        staff_sql   = _build(_STAFF_SQL,   _COMMON_SELECT_STAFF,  _LESSON_JOINS_STAFF)
+
+        # Drop any leftover tables from a previous interrupted run
+        for _t in ("_alloc_non_ple", "_alloc_ple", "_alloc_staff", "_alloc_precomputed"):
+            self._con.execute(f"DROP TABLE IF EXISTS {_t}")
+
+        # For each path: create a table with career_path_updated_at cast to
+        # TIMESTAMP and moved to the end (after EXCLUDE). This ensures all
+        # three paths have the same column order for the UNION ALL below.
+        # non_ple and staff have NULL career_path_updated_at (INTEGER in DuckDB);
+        # ple has actual TIMESTAMP values. TRY_CAST normalises all to TIMESTAMP.
+        _path_specs = [
+            ("_alloc_non_ple", non_ple_sql, "non_ple",
+             "centre_subject [-> batch_subject if batch] [-> subject_trade if trade]"),
+            ("_alloc_ple",     ple_sql,     "ple",
+             "centre_subject [-> subject_ple_career_path if career_path] [-> batch_subject if batch]"),
+            ("_alloc_staff",   staff_sql,   "staff",
+             "centre_subject (admin: all; facilitator: facilitator_access; master_trainer: mastertrainer_access)"),
+        ]
+
+        for tbl, inner_sql, path_name, basis in _path_specs:
+            log.info("[table_cache]   %s: running full join ...", path_name)
+            t1 = time.time()
+            self._con.execute(
+                "CREATE TABLE " + tbl + " AS "
+                "SELECT * EXCLUDE (career_path_updated_at), "
+                "       TRY_CAST(career_path_updated_at AS TIMESTAMP) AS career_path_updated_at, "
+                "       '" + path_name + "' AS allocation_path, "
+                "       '" + basis + "' AS allocation_basis "
+                "FROM (" + inner_sql + ") AS _q"
+            )
+            cnt = self._con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            log.info("[table_cache]   %s: %d rows  (%.0fs)", path_name, cnt, time.time() - t1)
+
+        # Combine all paths and deduplicate to one row per (user_id, lesson_id).
+        # career_path_updated_at DESC NULLS LAST: keeps the most recent career
+        # path for PLE users enrolled in multiple career paths.
+        # career_path_updated_at is then excluded from the final table (matches
+        # what fetch_allocation() does via combined.drop(columns=[...]) in pandas).
+        log.info("[table_cache]   combining + deduplicating all paths ...")
+        t1 = time.time()
+        self._con.execute("""
+            CREATE TABLE _alloc_precomputed AS
+            SELECT * EXCLUDE (career_path_updated_at, _rn)
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY user_id, lesson_id
+                           ORDER BY career_path_updated_at DESC NULLS LAST
+                       ) AS _rn
+                FROM (
+                    SELECT * FROM _alloc_non_ple
+                    UNION ALL
+                    SELECT * FROM _alloc_ple
+                    UNION ALL
+                    SELECT * FROM _alloc_staff
+                )
+            )
+            WHERE _rn = 1
+        """)
+
+        for _t in ("_alloc_non_ple", "_alloc_ple", "_alloc_staff"):
+            self._con.execute(f"DROP TABLE IF EXISTS {_t}")
+
+        total = self._con.execute("SELECT COUNT(*) FROM _alloc_precomputed").fetchone()[0]
+        log.info("[table_cache]   combine+dedup: %d rows  (%.0fs)", total, time.time() - t1)
+        log.info("[table_cache] ✓ _alloc_precomputed ready — %d rows  (total elapsed: %.0fs)",
+                 total, time.time() - t0)
+        log.info("[table_cache] ─────────────────────────────────────────────────────")
+        return total
+
+    def alloc_precomputed_exists(self) -> bool:
+        """True if _alloc_precomputed was built this run and is still present."""
+        try:
+            return self._con.execute(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_name = '_alloc_precomputed'"
+            ).fetchone()[0] > 0
+        except Exception:
+            return False
+
+    def load_alloc_precomputed_chunk(self, user_ids: list) -> pd.DataFrame:
+        """
+        Return allocation rows for user_ids from the pre-computed table.
+        Sub-second — no JOIN, just a filtered scan of the materialised table.
+        """
+        if not user_ids:
+            return pd.DataFrame()
+        ph = ", ".join(["?" for _ in user_ids])
+        return self._con.execute(
+            f"SELECT * FROM _alloc_precomputed WHERE user_id IN ({ph})",
+            user_ids,
+        ).fetchdf()
+
+    def drop_alloc_precomputed(self):
+        """Drop the pre-computed allocation table (cleanup after run completes)."""
+        self._con.execute("DROP TABLE IF EXISTS _alloc_precomputed")
+        log.info("[table_cache] _alloc_precomputed dropped (cleanup)")
 
     def make_fetch_fn(self):
         """
