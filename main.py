@@ -53,7 +53,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from config import ANALYTICS_DB, ALLOC_CHUNK_SIZE, LEARNER_TYPES_SQL, STAFF_ALLOC_CHUNK_SIZE, OUTPUT_DIR
+from config import ANALYTICS_DB, ALLOC_CHUNK_SIZE, STAFF_ALLOC_CHUNK_SIZE, OUTPUT_DIR
 from db import delete_user_rows, write_table
 from steps.s0_cache import AllocationCache, ResultBuffer, TableCache
 from steps.s0_changed_users import fetch_changed_user_ids
@@ -383,9 +383,8 @@ def run(
     _cache_eligible = not _scoped and not since
 
     cache: AllocationCache | None = None
-    _alloc_from_cache       = False
-    _use_precomputed_alloc  = False
-    _cache_total_rows       = 0
+    _alloc_from_cache = False
+    _cache_total_rows = 0
 
     # fetch_fn is passed to s1 + s2 so they query DuckDB instead of MySQL.
     # None means fall back to the normal db.fetch (production MySQL).
@@ -403,6 +402,7 @@ def run(
             tbl.refresh()
         else:
             tbl.log_status()
+        tbl.build_indexes()
 
         # Refresh completion tables every run (live data).
         # incremental=True (default): appends only rows newer than last run.
@@ -419,20 +419,6 @@ def run(
         else:
             cache.reset()
             log.info("[cache] Allocation result cache will be rebuilt this run")
-            # Pre-compute full allocation for all users in ONE DuckDB pass.
-            # Turns 469 × 46s per-chunk JOINs into a single full-table JOIN,
-            # reducing total allocation time from ~10 hours to ~15–30 minutes.
-            # Each chunk then reads from _alloc_precomputed with a fast
-            # WHERE user_id IN (...) lookup instead of re-running JOINs.
-            try:
-                tbl.precompute_allocation(LEARNER_TYPES_SQL)
-                _use_precomputed_alloc = True
-            except Exception as _exc:
-                log.warning(
-                    "[table_cache] precompute_allocation failed (%s) — "
-                    "falling back to per-chunk JOIN queries", _exc
-                )
-                _use_precomputed_alloc = False
 
     # ── Result buffer ─────────────────────────────────────────────────────────
     # Buffer chunk results in DuckDB, flush to analytics DB once at the end.
@@ -523,7 +509,7 @@ def run(
         alloc_paths = ("non_ple", "ple") if chunk_type == "learner" else ("staff",)
 
         if _alloc_from_cache:
-            # Load from local DuckDB allocation_cache — no JOIN needed.
+            # Load from local DuckDB — no SSH connection needed for allocation.
             try:
                 alloc = cache.load_chunk(chunk_ids)
                 log.info("[cache] Chunk %d allocation → DuckDB (%d rows)", chunk_idx, len(alloc))
@@ -536,28 +522,6 @@ def run(
                     paths=alloc_paths,
                 )
                 log.info("[cache] Chunk %d allocation → production (cache fallback)", chunk_idx)
-        elif _use_precomputed_alloc:
-            # Read from pre-computed full-allocation table — sub-second per chunk.
-            # No JOINs, no SSH, just a WHERE user_id IN (...) scan on the
-            # already-materialised _alloc_precomputed table.
-            try:
-                alloc = tbl.load_alloc_precomputed_chunk(chunk_ids)
-                log.info("[cache] Chunk %d allocation → _alloc_precomputed (%d rows)", chunk_idx, len(alloc))
-            except Exception as exc:
-                log.warning(
-                    "[cache] _alloc_precomputed read failed (%s) — falling back to JOIN query", exc
-                )
-                alloc = fetch_allocation(
-                    user_ids=chunk_ids,
-                    centre_id=centre_id, batch_id=batch_id,
-                    subject_id=subject_id, trade_id=trade_id,
-                    paths=alloc_paths,
-                    fetch_fn=fetch_fn,
-                )
-            # Still populate allocation_cache so the NEXT run can skip even this step.
-            if cache is not None and not alloc.empty:
-                cache.append(alloc)
-                _cache_total_rows += len(alloc)
         else:
             alloc = fetch_allocation(
                 user_ids=chunk_ids,
@@ -741,11 +705,6 @@ def run(
             cache.finalise(_cache_total_rows)
             cache.save_row_count_snapshot()
             log.info("[cache] Allocation cache rebuilt — %d rows saved to %s", _cache_total_rows, cache.path)
-        # Drop the pre-computed table — it was only needed for this run.
-        # Next run: if allocation unchanged, uses allocation_cache (fast).
-        #           if allocation changed, precomputes again.
-        if _use_precomputed_alloc:
-            tbl.drop_alloc_precomputed()
         cache.close()
 
     # ── All-lesson-types CSV (small runs only) ────────────────────────────────
