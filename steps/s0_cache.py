@@ -1079,6 +1079,7 @@ class ResultBuffer:
     def __init__(self, con: duckdb.DuckDBPyConnection):
         self._con     = con
         self._created: set[str] = set()
+        self._columns: dict[str, list] = {}
 
     def append(self, key: str, df: pd.DataFrame):
         """Append one chunk's result to the DuckDB buffer table."""
@@ -1091,7 +1092,14 @@ class ResultBuffer:
             self._con.execute(f"DROP TABLE IF EXISTS {buf}")
             self._con.execute(f"CREATE TABLE {buf} AS SELECT * FROM _rbuf")
             self._created.add(buf)
+            self._columns[buf] = list(df.columns)
         else:
+            # Reindex to match the schema established on first create.  Chunks
+            # that include no-allocation stub rows may carry extra columns
+            # (e.g. is_master_trainer, is_ple) not present in the first chunk.
+            schema_cols = self._columns[buf]
+            if list(df.columns) != schema_cols:
+                df = df.reindex(columns=schema_cols)
             self._con.register("_rbuf", df)
             self._con.execute(f"INSERT INTO {buf} SELECT * FROM _rbuf")
         self._con.unregister("_rbuf")
