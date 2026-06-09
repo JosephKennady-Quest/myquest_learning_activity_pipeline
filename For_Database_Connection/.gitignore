@@ -1,0 +1,19 @@
+# Credentials — never commit these
+.env
+DB_Config/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Output
+output/
+*.csv
+*.xlsx
