@@ -19,18 +19,16 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-from config import ANALYTICS_DB
+from config import ANALYTICS_DB, SOURCE_DB
 from db import fetch
 
 log = logging.getLogger(__name__)
 
-USER_ID_CANDIDATES = ("tlo_user_id", "tlo_users_id", "user_id", "id")
+USER_ID_CANDIDATES = ("tlo_users_id", "tlo_user_id", "user_id", "id")
 
-# Same user-level fields used by Cust JSON version/json_main_wcc_try.ipynb,
-# with tlo_user_id supported for main_users.
 PREFERRED_USER_COLS = [
-    "tlo_user_id",
     "tlo_users_id",
+    "user_name",
     "gender",
     "created_at",
     "centre_name",
@@ -86,7 +84,8 @@ OVERALL_COLS = [
 
 _PROJECT_PHASE_SQL = """
 SELECT
-    u.id                  AS tlo_user_id,
+    u.id                  AS tlo_users_id,
+    u.name                AS user_name,
     u.gender              AS gender,
     u.created_at          AS created_at,
     u.centre_name         AS centre_name,
@@ -95,10 +94,18 @@ SELECT
     u.centre_district     AS district_name,
     u.trade               AS trade,
     u.batch_name          AS batch_name,
+    CASE
+        WHEN u.batch_name IS NOT NULL THEN 'In Batch'
+        ELSE 'Not in Batch'
+    END                   AS batch_status,
     u.centre_type         AS centre_type,
     u.user_type           AS user_type,
     u.created_platform    AS platform,
     u.is_ple              AS is_ple,
+    CASE
+        WHEN cp.ple_enabled = 1 THEN 'PLE Centres'
+        ELSE 'Non-PLE Centres'
+    END                   AS ple_enabled,
     cp.program_name       AS __combo_prog_name,
     cp.project_id         AS __combo_project_id,
     cp.project_name       AS __combo_proj_name,
@@ -115,9 +122,19 @@ LEFT JOIN quest_analytics.main_phases ph
 {where_clause}
 """
 
+_LOGIN_SQL = """
+SELECT
+    user_id             AS tlo_users_id,
+    MIN(created_at)     AS first_login
+FROM quest_rearch_production.login_logs
+WHERE user_id IS NOT NULL
+  AND user_id IN ({placeholders})
+GROUP BY user_id
+"""
+
 _SUBJECT_SQL = """
 SELECT
-    user_id                       AS tlo_user_id,
+    user_id                       AS tlo_users_id,
     subject_id                    AS sub_id,
     subject_name                  AS sub_name,
     avg_score                     AS avg_score_a,
@@ -213,6 +230,17 @@ def _where_clause(
     return where_clause, tuple(params) if params else None
 
 
+def fetch_first_login(user_ids: list) -> pd.DataFrame:
+    """Fetch MIN(created_at) per user from production login_logs."""
+    if not user_ids:
+        return pd.DataFrame(columns=["tlo_users_id", "first_login"])
+    placeholders = ", ".join(["%s"] * len(user_ids))
+    sql = _LOGIN_SQL.format(placeholders=placeholders)
+    df = fetch(SOURCE_DB, sql, tuple(user_ids))
+    log.info("[s4_users_project_phase_json] fetched first_login for %d users", len(df))
+    return df
+
+
 def fetch_users_project_phase(
     user_id: str | None = None,
     centre_id: str | None = None,
@@ -290,16 +318,16 @@ def build_users_project_phase_json(df: pd.DataFrame) -> pd.DataFrame:
 def build_subject_json(df: pd.DataFrame) -> pd.DataFrame:
     """Returns subject_combos JSON + flat overall columns, one row per user."""
     if df.empty:
-        return pd.DataFrame(columns=["tlo_user_id", "subject_combos"] + OVERALL_COLS)
+        return pd.DataFrame(columns=["tlo_users_id", "subject_combos"] + OVERALL_COLS)
 
-    missing_subject_cols = [col for col in ["tlo_user_id"] + SUBJECT_COLS if col not in df.columns]
+    missing_subject_cols = [col for col in ["tlo_users_id"] + SUBJECT_COLS if col not in df.columns]
     if missing_subject_cols:
         raise ValueError(f"Missing expected subject columns: {missing_subject_cols}")
 
     subject_df = (
-        df[["tlo_user_id"] + SUBJECT_COLS]
+        df[["tlo_users_id"] + SUBJECT_COLS]
         .drop_duplicates()
-        .groupby("tlo_user_id", dropna=False)[SUBJECT_COLS]
+        .groupby("tlo_users_id", dropna=False)[SUBJECT_COLS]
         .apply(_records_to_json)
         .reset_index(name="subject_combos")
     )
@@ -310,10 +338,10 @@ def build_subject_json(df: pd.DataFrame) -> pd.DataFrame:
     overall_cols_present = [c for c in OVERALL_COLS if c in df.columns]
     if overall_cols_present:
         overall_df = (
-            df[["tlo_user_id"] + overall_cols_present]
-            .drop_duplicates(subset=["tlo_user_id"], keep="first")
+            df[["tlo_users_id"] + overall_cols_present]
+            .drop_duplicates(subset=["tlo_users_id"], keep="first")
         )
-        subject_df = subject_df.merge(overall_df, on="tlo_user_id", how="left")
+        subject_df = subject_df.merge(overall_df, on="tlo_users_id", how="left")
 
     subject_df = subject_df.replace({np.nan: None})
     log.info("[s4_users_project_phase_json] built %d subject JSON rows", len(subject_df))
@@ -338,7 +366,12 @@ def run_users_project_phase_json(
         batch_id=batch_id,
     )
     subject_json_df = build_subject_json(subjects_df)
+    final_df = final_df.merge(subject_json_df, on="tlo_users_id", how="left")
 
-    final_df = final_df.merge(subject_json_df, on="tlo_user_id", how="left")
+    # Fetch first_login from production login_logs for all users in this run.
+    user_ids = final_df["tlo_users_id"].dropna().unique().tolist()
+    login_df = fetch_first_login(user_ids)
+    final_df = final_df.merge(login_df, on="tlo_users_id", how="left")
+
     final_df = final_df.replace({np.nan: None})
     return final_df
