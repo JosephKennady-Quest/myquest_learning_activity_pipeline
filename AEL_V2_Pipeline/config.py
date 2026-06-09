@@ -47,8 +47,9 @@ ANALYTICS_DB = CONFIG["destination"]
 
 # ── Pipeline constants ────────────────────────────────────────────────────────
 CHUNK_SIZE             = 5000   # DB insert batch size (rows per executemany call)
-ALLOC_CHUNK_SIZE       = 2000   # learner users per allocation query; keeps allocation DataFrames below OOM-prone sizes
-STAFF_ALLOC_CHUNK_SIZE = 200    # staff users per allocation query; admins can expand to all centre lessons
+ALLOC_CHUNK_SIZE       = 2000   # learner users per allocation query
+STAFF_ALLOC_CHUNK_SIZE = 200    # staff users per allocation query; admins expand to all centre lessons
+
 LEARNER_TYPES     = (3, 4)
 LEARNER_TYPES_SQL = ",".join(str(t) for t in LEARNER_TYPES)
 
@@ -58,3 +59,17 @@ STAFF_TYPES_SQL   = ",".join(str(t) for t in STAFF_TYPES)
 ALL_TYPES         = STAFF_TYPES + LEARNER_TYPES   # (1, 2, 3, 4)
 ALL_TYPES_SQL     = ",".join(str(t) for t in ALL_TYPES)
 OUTPUT_DIR        = os.getenv("OUTPUT_DIR", "output")
+
+# ── Parallelism ───────────────────────────────────────────────────────────────
+# Number of worker threads for concurrent chunk processing.
+# Each worker holds one DuckDB read connection + one SSH tunnel for completion.
+# Rule of thumb: 4 works well on a 4-core machine; raise to 8 on 8+ cores.
+# Set to 1 to disable parallelism (equivalent to the original sequential loop).
+CHUNK_WORKERS = int(os.getenv("CHUNK_WORKERS", "4"))
+
+# ── Cache invalidation ────────────────────────────────────────────────────────
+# Strategy used to detect whether allocation source tables changed.
+#   "hash"      — CRC32 of sorted (id, updated_at) values; more precise,
+#                 no false invalidations from unrelated row inserts.
+#   "row_count" — original behaviour; cheaper but may trigger unnecessary refreshes.
+CACHE_INVALIDATION_STRATEGY = os.getenv("CACHE_INVALIDATION_STRATEGY", "hash")

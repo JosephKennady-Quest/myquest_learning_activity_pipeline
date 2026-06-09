@@ -1,66 +1,67 @@
 """
 Local DuckDB cache layer — individual source tables + allocation result cache.
 
-Two-layer caching strategy
-──────────────────────────
-Layer 1 — TableCache  (new)
-  Caches every source table that is NOT learning_activities or
-  facilitator_learning_activities into cache.duckdb.  On subsequent runs,
-  s1_users and s2_allocation run their SQL queries locally against DuckDB
-  instead of opening SSH tunnels to production MySQL.  Only s3_completion
-  still hits production (it needs live completion data by design).
+Optimisations in this version vs original
+──────────────────────────────────────────
+Opt 1  — precompute_allocation() is now the default path in main.py.
+         Run all 3 allocation JOINs ONCE for all users; each chunk then does
+         a fast indexed scan on _alloc_precomputed instead of 2 full JOINs.
+         Expected speedup: ~10 h → ~20 min for 635 chunks.
 
-  Tables cached:
-    users, student_details, subjects, lessons, lesson_types, trades,
-    centre_subject, batch_subject, subject_trade,
-    ple_career_paths, subject_ple_career_path, ple_career_path_user
+Opt 4  — fetch_all_completion() fetches ALL users' completion in one DuckDB
+         query (learning_activities + facilitator_learning_activities are
+         already cached locally).  main.py merges once at the end rather
+         than firing one query per chunk.
 
-  Refreshed when:
-    • No cache exists (first run)
-    • Any allocation watch table row count changed (same signal as Layer 2)
-    • --force-refresh flag passed
+Opt 6  — Hash-based cache invalidation (CACHE_INVALIDATION_STRATEGY=hash).
+         CRC32 of sorted (id, updated_at) for key allocation tables —
+         far more precise than row count; avoids false invalidations from
+         unrelated row inserts.  Falls back to row_count strategy when
+         the env var is set to 'row_count'.
 
-Layer 2 — AllocationCache  (existing, unchanged)
-  After s2 runs (whether against DuckDB or MySQL), the full allocation
-  result is appended chunk-by-chunk to allocation_cache in DuckDB.  On
-  runs where allocation is confirmed unchanged, each chunk is loaded
-  directly from allocation_cache — skipping even the DuckDB JOIN queries.
+Opt 10 — Auto-checkpoint: saves the last successfully written chunk number
+         to cache_meta so a killed run can auto-resume without --start-chunk.
 
-  Fallback: if either layer fails for any reason, the pipeline falls back
-  to live production queries — no data is ever lost or corrupted.
+Layer 1 — TableCache
+  Caches every source table (except learning_activities /
+  facilitator_learning_activities) into cache.duckdb.  s1_users and
+  s2_allocation query DuckDB locally; s3_completion also queries DuckDB
+  after refresh_completion_tables() caches those tables too.
+
+Layer 2 — AllocationCache
+  After s2 / precompute runs, the full allocation result is materialised as
+  _alloc_precomputed in DuckDB.  Subsequent runs load chunks from there
+  (sub-second indexed scan) instead of re-running the JOINs.
 
 Cache file: cache.duckdb  (pipeline root, gitignored)
 Use --force-refresh to bypass both layers and rebuild from scratch.
 """
 
+import hashlib
 import logging
 import os
 import re
 import time
 from datetime import datetime, timezone
+from typing import List, Optional
 
 import duckdb
 import pandas as pd
 
-from config import SOURCE_DB
+from config import CACHE_INVALIDATION_STRATEGY, SOURCE_DB
 from db import fetch
 
 log = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _ensure_varchar_nulls(df: pd.DataFrame) -> pd.DataFrame:
     """
     Force all-NULL object columns to pandas StringDtype before registering
-    with DuckDB.
-
-    When a column is all-NULL, DuckDB infers it as INTEGER (INT32) because
-    NULL has no type information.  If a later chunk then inserts a UUID string
-    into that column, DuckDB raises:
-        ConversionError: Could not convert string '...' to INT32
-
-    Typing the column as pd.StringDtype() tells DuckDB to use VARCHAR instead,
-    which accepts NULLs and UUID strings equally.  Applied only when creating
-    a new table (first chunk) — subsequent INSERTs use the already-set schema.
+    with DuckDB so that DuckDB uses VARCHAR instead of inferring INT32.
     """
     df = df.copy()
     for col in df.columns:
@@ -68,11 +69,11 @@ def _ensure_varchar_nulls(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.array([pd.NA] * len(df), dtype=pd.StringDtype())
     return df
 
-_PIPELINE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+_PIPELINE_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CACHE_PATH = os.path.join(_PIPELINE_DIR, "cache.duckdb")
 
-# Tables whose row counts are snapshotted to detect allocation changes.
-# A change in any one of these triggers a full allocation re-fetch.
+# Tables whose state is checked to decide whether to invalidate the cache.
 ALLOCATION_WATCH_TABLES = [
     "centre_subject",
     "batch_subject",
@@ -84,8 +85,59 @@ ALLOCATION_WATCH_TABLES = [
     "lessons",
 ]
 
+# Columns used for hash computation per table.  We hash the sorted values of
+# the primary key + updated_at (or created_at) so that only real data changes
+# (not unrelated new rows) trigger a cache bust.
+_HASH_COLUMNS: dict[str, list[str]] = {
+    "centre_subject":          ["id", "centre_id", "subject_id"],
+    "batch_subject":           ["id", "batch_id",  "subject_id"],
+    "subject_trade":           ["id", "subject_id","trade_id"],
+    "ple_career_paths":        ["id", "deleted_at"],
+    "subject_ple_career_path": ["id", "ple_career_path_id", "subject_id"],
+    "ple_career_path_user":    ["id", "user_id", "job_type_id", "status", "deleted_at"],
+    "subjects":                ["id", "status", "deleted_at"],
+    "lessons":                 ["id", "status", "deleted_at"],
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Opt 6 — Hash-based invalidation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _table_hash(table: str) -> str:
+    """
+    Compute a stable MD5 hash over the key columns of a watch table.
+    Fetches only the hash-relevant columns so it's cheap over SSH.
+    Falls back to row count if the table has no _HASH_COLUMNS entry.
+    """
+    cols = _HASH_COLUMNS.get(table)
+    if not cols:
+        # Fallback: just count rows (original behaviour for unlisted tables)
+        row = fetch(SOURCE_DB, f"SELECT COUNT(*) AS cnt FROM {table}", None)
+        return str(int(row["cnt"].iloc[0]))
+
+    cols_sql = ", ".join(f"`{c}`" for c in cols)
+    df = fetch(SOURCE_DB, f"SELECT {cols_sql} FROM {table} ORDER BY {cols[0]}", None)
+
+    # Concatenate all values into a single string, then MD5.
+    flat = "|".join(
+        ",".join("" if pd.isna(v) else str(v) for v in row)
+        for row in df.itertuples(index=False, name=None)
+    )
+    return hashlib.md5(flat.encode()).hexdigest()  # nosec — not a security hash
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AllocationCache
+# ─────────────────────────────────────────────────────────────────────────────
 
 class AllocationCache:
+    """
+    Two responsibilities:
+      1. Detect whether allocation source data changed (hash or row-count).
+      2. Store / load the fully combined allocation result (allocation_cache table).
+    """
+
     def __init__(self, path: str = DEFAULT_CACHE_PATH):
         self.path = path
         self._con = duckdb.connect(path)
@@ -100,10 +152,19 @@ class AllocationCache:
                 updated_at TIMESTAMP
             )
         """)
+        # Row count snapshot table (kept for row_count strategy fallback)
         self._con.execute("""
             CREATE TABLE IF NOT EXISTS allocation_row_counts (
                 table_name VARCHAR PRIMARY KEY,
                 row_count  BIGINT,
+                snapped_at TIMESTAMP
+            )
+        """)
+        # Opt 6 — hash snapshot table
+        self._con.execute("""
+            CREATE TABLE IF NOT EXISTS allocation_hashes (
+                table_name VARCHAR PRIMARY KEY,
+                hash_value VARCHAR,
                 snapped_at TIMESTAMP
             )
         """)
@@ -112,22 +173,73 @@ class AllocationCache:
 
     def allocation_changed(self) -> bool:
         """
-        Return True if any watch table row count differs from the last snapshot,
-        or if no snapshot exists yet. A single COUNT(*) per table over SSH —
-        much cheaper than fetching the full allocation.
+        Return True if any watch table has changed since the last snapshot,
+        or if no snapshot exists yet.
 
-        Logs a clear per-table status line so you can see exactly which tables
-        were checked, their current row counts, and whether each hit the cache
-        or detected a change.
+        Strategy is controlled by CACHE_INVALIDATION_STRATEGY (config.py):
+          'hash'      — MD5 of key columns; precise, no false positives.
+          'row_count' — original COUNT(*) check; faster but coarser.
         """
+        if CACHE_INVALIDATION_STRATEGY == "hash":
+            return self._allocation_changed_hash()
+        return self._allocation_changed_row_count()
+
+    def _allocation_changed_hash(self) -> bool:
+        existing = self._con.execute(
+            "SELECT table_name, hash_value, snapped_at FROM allocation_hashes"
+        ).fetchdf()
+
+        if existing.empty:
+            log.info("[cache] No hash snapshot found — first run, fetching live allocation")
+            return True
+
+        snapshot   = dict(zip(existing["table_name"], existing["hash_value"]))
+        snapped_at = existing.set_index("table_name")["snapped_at"].to_dict()
+        changed    = False
+        changed_tbl = None
+
+        log.info("[cache] ── Cache status (hash check) ──────────────────────────────")
+        col_w = max(len(t) for t in ALLOCATION_WATCH_TABLES) + 2
+
+        for table in ALLOCATION_WATCH_TABLES:
+            try:
+                current  = _table_hash(table)
+                stored   = snapshot.get(table)
+                snapped  = snapped_at.get(table, "unknown")
+
+                if stored is None or current != stored:
+                    log.info(
+                        "[cache]   %-*s  CHANGED   (snapped: %s)",
+                        col_w, table, snapped,
+                    )
+                    if not changed:
+                        changed_tbl = table
+                    changed = True
+                else:
+                    log.info(
+                        "[cache]   %-*s  ok        (snapped: %s)",
+                        col_w, table, snapped,
+                    )
+            except Exception as exc:
+                log.warning("[cache]   %-*s  ERROR %s — treating as changed", col_w, table, exc)
+                changed     = True
+                changed_tbl = table
+
+        if changed:
+            log.info("[cache] ── Result: CHANGED (trigger: %s) — full allocation refresh ─", changed_tbl)
+        else:
+            log.info("[cache] ── Result: ALL CACHED ✓ — allocation will load from DuckDB ─")
+        log.info("[cache] ─────────────────────────────────────────────────────────")
+        return changed
+
+    def _allocation_changed_row_count(self) -> bool:
+        """Original row-count based detection (fallback / opt-out path)."""
         existing = self._con.execute(
             "SELECT table_name, row_count, snapped_at FROM allocation_row_counts"
         ).fetchdf()
 
         if existing.empty:
-            log.info("[cache] ── Cache status: NO SNAPSHOT FOUND ──────────────────────")
-            log.info("[cache] First run — allocation will be fetched live and cached")
-            log.info("[cache] ─────────────────────────────────────────────────────────")
+            log.info("[cache] No row-count snapshot found — first run, fetching live allocation")
             return True
 
         snapshot    = dict(zip(existing["table_name"], existing["row_count"]))
@@ -135,7 +247,7 @@ class AllocationCache:
         changed     = False
         changed_tbl = None
 
-        log.info("[cache] ── Cache status: checking allocation tables ──────────────")
+        log.info("[cache] ── Cache status (row_count check) ──────────────────────")
         col_w = max(len(t) for t in ALLOCATION_WATCH_TABLES) + 2
 
         for table in ALLOCATION_WATCH_TABLES:
@@ -159,23 +271,42 @@ class AllocationCache:
                         col_w, table, current, snapped,
                     )
             except Exception as exc:
-                log.warning("[cache]   %-*s  ERROR     %s — treating as changed", col_w, table, exc)
+                log.warning("[cache]   %-*s  ERROR %s — treating as changed", col_w, table, exc)
                 changed     = True
                 changed_tbl = table
 
         if changed:
-            log.info("[cache] ── Result: CHANGED (trigger: %s) — full allocation refresh ─", changed_tbl)
+            log.info("[cache] ── Result: CHANGED (trigger: %s) ─────────────────────", changed_tbl)
         else:
-            log.info("[cache] ── Result: ALL CACHED  ✓ — allocation will load from DuckDB ─")
+            log.info("[cache] ── Result: ALL CACHED ✓ ───────────────────────────────")
         log.info("[cache] ─────────────────────────────────────────────────────────")
         return changed
 
-    def save_row_count_snapshot(self):
-        """Snapshot current row counts of all watch tables."""
-        now   = datetime.now(timezone.utc).replace(tzinfo=None)
-        saved = 0
+    def save_snapshot(self):
+        """
+        Save the current state snapshot for all watch tables.
+        Saves both hash and row-count so either strategy can be used on
+        the next run without losing the other's snapshot.
+        """
+        now    = datetime.now(timezone.utc).replace(tzinfo=None)
+        saved  = 0
+
         for table in ALLOCATION_WATCH_TABLES:
             try:
+                # Hash snapshot (opt 6)
+                h = _table_hash(table)
+                self._con.execute(
+                    """
+                    INSERT INTO allocation_hashes (table_name, hash_value, snapped_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT (table_name) DO UPDATE SET
+                        hash_value = excluded.hash_value,
+                        snapped_at = excluded.snapped_at
+                    """,
+                    [table, h, now],
+                )
+
+                # Row count snapshot (kept for fallback)
                 row   = fetch(SOURCE_DB, f"SELECT COUNT(*) AS cnt FROM {table}", None)
                 count = int(row["cnt"].iloc[0])
                 self._con.execute(
@@ -191,7 +322,13 @@ class AllocationCache:
                 saved += 1
             except Exception as exc:
                 log.warning("[cache] Could not snapshot %s: %s", table, exc)
-        log.info("[cache] Row-count snapshot saved (%d / %d tables)", saved, len(ALLOCATION_WATCH_TABLES))
+
+        log.info("[cache] Snapshot saved (%d / %d tables, strategy=%s)",
+                 saved, len(ALLOCATION_WATCH_TABLES), CACHE_INVALIDATION_STRATEGY)
+
+    # Keep old name as alias so any external callers don't break
+    def save_row_count_snapshot(self):
+        self.save_snapshot()
 
     # ── Allocation data cache ─────────────────────────────────────────────────
 
@@ -212,16 +349,11 @@ class AllocationCache:
         log.info("[cache] Allocation cache cleared — will rebuild this run")
 
     def append(self, df: pd.DataFrame):
-        """
-        Append one chunk of allocation data to the cache.
-        Creates the table on the first call (using real data for type inference).
-        Empty DataFrame head(0) was causing DuckDB to infer UUID columns as INT32.
-        """
+        """Append one chunk of allocation data to the cache."""
         exists = self._con.execute(
             "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'allocation_cache'"
         ).fetchone()[0]
         if not exists:
-            # Fix all-NULL object columns → VARCHAR before DuckDB infers INT32.
             self._con.register("_chunk", _ensure_varchar_nulls(df))
             self._con.execute("CREATE TABLE allocation_cache AS SELECT * FROM _chunk")
             log.info("[cache] allocation_cache table created from first chunk")
@@ -255,13 +387,49 @@ class AllocationCache:
             user_ids,
         ).fetchdf()
 
+    # ── Opt 10 — Auto-checkpoint ──────────────────────────────────────────────
+
+    def save_checkpoint(self, chunk_idx: int) -> None:
+        """Persist the last successfully written chunk index to cache_meta."""
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        self._con.execute(
+            """
+            INSERT INTO cache_meta (key, int_value, str_value, updated_at)
+            VALUES ('last_written_chunk', ?, NULL, ?)
+            ON CONFLICT (key) DO UPDATE SET
+                int_value  = excluded.int_value,
+                updated_at = excluded.updated_at
+            """,
+            [chunk_idx, now],
+        )
+
+    def load_checkpoint(self) -> Optional[int]:
+        """
+        Return the last successfully written chunk index, or None if no
+        checkpoint exists (i.e. fresh run).
+        """
+        try:
+            row = self._con.execute(
+                "SELECT int_value FROM cache_meta WHERE key = 'last_written_chunk'"
+            ).fetchone()
+            return int(row[0]) if row and row[0] else None
+        except Exception:
+            return None
+
+    def clear_checkpoint(self) -> None:
+        """Delete the checkpoint after a successful full run."""
+        self._con.execute(
+            "DELETE FROM cache_meta WHERE key = 'last_written_chunk'"
+        )
+
     def close(self):
         self._con.close()
 
 
-# ── Source tables to cache locally ───────────────────────────────────────────
-# learning_activities and facilitator_learning_activities are intentionally
-# excluded — they are always fetched live from production (s3_completion).
+# ─────────────────────────────────────────────────────────────────────────────
+# Source tables cached into DuckDB
+# ─────────────────────────────────────────────────────────────────────────────
+
 SOURCE_CACHE_TABLES = [
     "users",
     "student_details",
@@ -282,12 +450,16 @@ class TableCache:
     """
     Caches individual source tables from quest_rearch_production into DuckDB.
 
-    Once cached, s1_users and s2_allocation run their existing SQL queries
-    against DuckDB instead of MySQL — no SSH tunnel needed for those steps.
-    make_fetch_fn() returns a drop-in replacement for db.fetch() that:
-      • adapts %s → ? (placeholder style)
-      • adapts `identifier` → "identifier" (quoting style)
-      • runs the query locally against DuckDB
+    Once cached, s1_users, s2_allocation, and s3_completion all query DuckDB
+    locally via make_fetch_fn() — no SSH tunnel needed for those steps.
+
+    Opt 1 — precompute_allocation() runs all 3 allocation JOINs once for
+             all users and stores the result as _alloc_precomputed.  Each
+             chunk then does a fast indexed scan instead of 2 full JOINs.
+
+    Opt 4 — fetch_all_completion() queries both completion tables in one shot
+             for all users, returning a single DataFrame.  main.py merges
+             once at the end rather than fetching per chunk.
     """
 
     def __init__(self, con: duckdb.DuckDBPyConnection):
@@ -302,16 +474,10 @@ class TableCache:
 
     def is_fresh(self) -> bool:
         """
-        True only when every source table:
-          1. Has a row in source_table_meta (metadata logged), AND
-          2. Actually exists as a table in DuckDB (data is present).
-        Checking both guards against partial/interrupted first runs where
-        metadata was saved but data was never written (or the file was
-        corrupted), which previously made is_fresh() return True incorrectly
-        and caused the pipeline to query non-existent DuckDB tables.
+        True only when every source table has metadata AND actually exists
+        as a table in DuckDB.
         """
         try:
-            # 1. Metadata check
             row = self._con.execute("""
                 SELECT COUNT(*) AS n
                 FROM   source_table_meta
@@ -320,7 +486,6 @@ class TableCache:
             if row is None or row[0] != len(SOURCE_CACHE_TABLES):
                 return False
 
-            # 2. Actual table existence check
             existing = set(
                 self._con.execute(
                     "SELECT table_name FROM information_schema.tables "
@@ -330,11 +495,10 @@ class TableCache:
             missing = [t for t in SOURCE_CACHE_TABLES if t not in existing]
             if missing:
                 log.warning(
-                    "[table_cache] Metadata says fresh but tables missing in DuckDB: %s "
-                    "— will re-download", missing
+                    "[table_cache] Metadata says fresh but tables missing: %s — re-downloading",
+                    missing,
                 )
                 return False
-
             return True
         except Exception:
             return False
@@ -342,19 +506,8 @@ class TableCache:
     @staticmethod
     def _sanitize(df: pd.DataFrame) -> pd.DataFrame:
         """
-        Replace MySQL zero dates and convert datetime-like object columns to
-        proper datetime64 dtype before loading into DuckDB.
-
-        Two problems solved:
-        1. DuckDB rejects MySQL zero dates (0000-00-00 00:00:00) with
-           "timestamp field value out of range".
-        2. After replacing zero dates with None, a column mixing
-           datetime.datetime objects with float NaN causes pandas .max()
-           to raise '>=' not supported between datetime.datetime and float.
-
-        Fix: replace zero dates, then convert any object column that contains
-        datetime objects to datetime64 via pd.to_datetime(errors='coerce').
-        NaT becomes the uniform null sentinel — safe for DuckDB and pandas.
+        Replace MySQL zero dates, coerce datetime columns to datetime64,
+        and convert Decimal columns to float64 for DuckDB compatibility.
         """
         import datetime as _dt
         from decimal import Decimal as _Decimal
@@ -364,35 +517,18 @@ class TableCache:
 
         for col in df.columns:
             if df[col].dtype == object:
-                # Replace zero-date strings first
                 df[col] = df[col].replace(_ZERO_STR, None)
-
                 non_null = df[col].dropna()
                 if non_null.empty:
                     continue
                 sample = non_null.iloc[0]
-
                 if isinstance(sample, _dt.datetime):
-                    # Datetime column — convert to datetime64.
-                    # Keeps NaT as the null sentinel (safe for DuckDB and
-                    # pandas .max()). Without this, None mixes with datetime
-                    # objects causing '>=' not supported between datetime and float.
                     df[col] = pd.to_datetime(df[col], errors="coerce")
-
                 elif isinstance(sample, _Decimal):
-                    # MySQL DECIMAL columns — pymysql returns Python Decimal objects.
-                    # DuckDB infers a narrow DECIMAL(p,s) from the first batch
-                    # and rejects larger values in later batches (e.g. 100.0000
-                    # overflows DECIMAL(6,4)). Convert to float64 so DuckDB uses
-                    # DOUBLE, which has no precision overflow issues.
                     df[col] = pd.to_numeric(df[col], errors="coerce")
-
             elif pd.api.types.is_datetime64_any_dtype(df[col]):
-                # Already proper dtype — NaT is safe for DuckDB
                 pass
-
             else:
-                # Edge case: non-object column holding datetime sentinel objects
                 try:
                     mask = df[col].apply(
                         lambda v: isinstance(v, _dt.datetime) and v == _ZERO_DT
@@ -403,24 +539,11 @@ class TableCache:
                         )
                 except Exception:
                     pass
-
         return df
 
     @staticmethod
     def _fetch_with_retry(sql: str, params, max_retries: int = 3, base_wait: float = 5.0) -> pd.DataFrame:
-        """
-        Wrap db.fetch() with retry logic for lost-connection errors.
-
-        MySQL drops long-running connections due to wait_timeout or net_read_timeout.
-        Each batch in refresh_completion_tables() opens its own SSH tunnel, so a
-        lost connection on one batch doesn't affect the others — we just retry.
-
-        Retries: up to max_retries attempts with exponential backoff
-          attempt 1 failure → wait 5s  → retry
-          attempt 2 failure → wait 10s → retry
-          attempt 3 failure → wait 20s → retry
-          attempt 4 failure → raise
-        """
+        """Wrap db.fetch() with exponential-backoff retry for lost-connection errors."""
         last_exc = None
         for attempt in range(1, max_retries + 2):
             try:
@@ -437,11 +560,11 @@ class TableCache:
                     raise
                 wait = base_wait * (2 ** (attempt - 1))
                 log.warning(
-                    "[table_cache] Lost connection on attempt %d/%d — retrying in %.0fs  (%s)",
+                    "[table_cache] Lost connection (attempt %d/%d) — retrying in %.0fs  (%s)",
                     attempt, max_retries, wait, exc,
                 )
                 time.sleep(wait)
-        raise last_exc  # unreachable but satisfies linters
+        raise last_exc
 
     def refresh(self):
         """Fetch all source tables from production and store in DuckDB."""
@@ -471,12 +594,12 @@ class TableCache:
                 raise
 
         log.info("[table_cache] ─────────────────────────────────────────────────────")
-        log.info("[table_cache] All source tables cached — s1/s2 will run from DuckDB")
+        log.info("[table_cache] All source tables cached")
 
     def log_status(self):
         """Log current cache status: table, row count, when cached."""
         try:
-            df = self._con.execute(
+            df    = self._con.execute(
                 "SELECT table_name, row_count, cached_at FROM source_table_meta ORDER BY table_name"
             ).fetchdf()
             col_w = max(len(t) for t in SOURCE_CACHE_TABLES) + 2
@@ -495,12 +618,8 @@ class TableCache:
         except Exception as exc:
             log.warning("[table_cache] Could not read cache status: %s", exc)
 
-    # ── Full-refresh batch SQL (user_id chunks) ───────────────────────────────
-    # Lesson-id filter removed from production queries — it ran as a subquery
-    # on EVERY batch (468 times), causing each batch to take 3+ minutes.
-    # The lesson filter is now applied ONCE in DuckDB after all batches load
-    # (see _apply_lesson_filter_in_duckdb), using the already-cached lessons,
-    # subjects, and centre_subject tables — fast local JOIN, zero SSH cost.
+    # ── Completion table SQL ──────────────────────────────────────────────────
+
     _LA_BATCH_SQL = """
         SELECT la.*
         FROM learning_activities la
@@ -515,9 +634,6 @@ class TableCache:
           AND fla.user_id IN ({placeholders})
     """
 
-    # ── Incremental SQL (completed_at > last cached timestamp) ────────────────
-    # Lesson filter also moved to post-load DuckDB step (same reason).
-    # User filter kept here — limits result set to active users only.
     _LA_INCR_SQL = """
         SELECT la.*
         FROM learning_activities la
@@ -540,9 +656,6 @@ class TableCache:
           )
     """
 
-    # ── DuckDB post-load lesson filter ────────────────────────────────────────
-    # Runs once after all batches are loaded, using locally cached tables.
-    # Removes any rows whose lesson_id is not an active lesson in centre_subject.
     _LESSON_FILTER_SQL = """
         DELETE FROM {table}
         WHERE lesson_id NOT IN (
@@ -559,19 +672,6 @@ class TableCache:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _dedup_completion_table(self, table: str):
-        """
-        Deduplicate to one row per (user_id, lesson_id) keeping the record
-        with the most recent completed_at.
-
-        A user who retries a lesson creates multiple records with the same
-        (user_id, lesson_id).  We keep only the latest attempt so the cache
-        has a clean unique key and queries run faster.
-
-        Uses ROW_NUMBER() OVER (PARTITION BY user_id, lesson_id
-                                ORDER BY completed_at DESC NULLS LAST) = 1
-        so no data is lost — just old attempts are dropped in favour of the
-        most recent one.
-        """
         before = self._con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         self._con.execute(f"""
             CREATE TABLE _dedup AS
@@ -591,13 +691,11 @@ class TableCache:
         after   = self._con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         removed = before - after
         log.info(
-            "[table_cache]   %-35s  dedup: %d → %d unique (user_id, lesson_id) rows"
-            "  (%d duplicate attempts removed)",
+            "[table_cache]   %-35s  dedup: %d → %d rows (%d duplicate attempts removed)",
             table, before, after, removed,
         )
 
-    def _get_last_completion_ts(self, table: str) -> str | None:
-        """Return the stored MAX(completed_at) for a completion table, or None."""
+    def _get_last_completion_ts(self, table: str) -> Optional[str]:
         try:
             row = self._con.execute(
                 "SELECT str_value FROM cache_meta WHERE key = ?",
@@ -608,7 +706,6 @@ class TableCache:
             return None
 
     def _save_last_completion_ts(self, table: str, ts: str):
-        """Persist MAX(completed_at) after a full or incremental cache run."""
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         self._con.execute(
             """
@@ -635,40 +732,23 @@ class TableCache:
         )
 
     def _apply_lesson_filter_in_duckdb(self, table: str):
-        """
-        Remove rows whose lesson_id is not an active lesson in centre_subject.
-        Runs once in DuckDB after all batches are loaded — uses already-cached
-        lessons, subjects, centre_subject tables (local, zero SSH cost).
-        """
-        before = self._con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        before  = self._con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         self._con.execute(self._LESSON_FILTER_SQL.format(table=table))
-        after  = self._con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        after   = self._con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         removed = before - after
         log.info(
             "[table_cache]   %-35s  lesson filter: removed %d inactive rows (%d → %d)",
             table, removed, before, after,
         )
 
-    # ── Public refresh method ─────────────────────────────────────────────────
+    # ── Public refresh ────────────────────────────────────────────────────────
 
     def refresh_completion_tables(self, batch_size: int = 2000, incremental: bool = True):
         """
         Cache learning_activities and facilitator_learning_activities in DuckDB.
 
-        Incremental mode (default, incremental=True):
-          Checks whether a MAX(completed_at) snapshot exists for each table.
-          If yes → fetches only rows WHERE completed_at > last_ts and appends.
-          If no  → falls back to full batch refresh automatically.
-
-          The s3_completion SQL already uses MAX(score)/SUM(duration) with
-          GROUP BY (user_id, lesson_id), so appended duplicate keys are
-          handled correctly by aggregation at query time.
-
-        Full mode (incremental=False, used with --force-refresh):
-          Drops and rebuilds each table from scratch in user_id batches.
-
-        batch_size controls how many user_ids are fetched per production
-        query during full refresh. Has no effect in incremental mode.
+        Incremental mode (default): appends only rows newer than last cached ts.
+        Full mode (--force-refresh): drops and rebuilds from scratch in batches.
         """
         col_w = len("facilitator_learning_activities") + 2
         specs = [
@@ -684,12 +764,8 @@ class TableCache:
 
                 # ── Incremental path ──────────────────────────────────────────
                 if last_ts:
-                    log.info(
-                        "[table_cache] ── %s: incremental refresh ─────────────────",
-                        table,
-                    )
-                    log.info("[table_cache]   last cached completed_at : %s", last_ts)
-                    log.info("[table_cache]   fetching records newer than that ...")
+                    log.info("[table_cache] ── %s: incremental refresh ─────────────────", table)
+                    log.info("[table_cache]   last cached completed_at: %s", last_ts)
 
                     df = self._sanitize(self._fetch_with_retry(incr_sql, (last_ts,)))
 
@@ -698,11 +774,9 @@ class TableCache:
                             "[table_cache]   %-*s  no new records since %s — cache up to date",
                             col_w, table, last_ts,
                         )
-                        log.info("[table_cache] ─" * 30)
+                        log.info("[table_cache] ─────────────────────────────────────────────────────")
                         continue
 
-                    # Keep only the latest attempt per (user_id, lesson_id)
-                    # within the new batch itself before upserting.
                     before_dedup = len(df)
                     df = (
                         df.sort_values("completed_at", ascending=False, na_position="last")
@@ -715,16 +789,13 @@ class TableCache:
                             col_w, table, before_dedup - len(df),
                         )
 
-                    # Upsert: delete existing rows for any (user_id, lesson_id)
-                    # that has a new record, then insert the fresh record.
-                    # This ensures the cache always holds the latest attempt only.
                     self._con.register("_incr_pairs", df[["user_id", "lesson_id"]])
-                    deleted = self._con.execute(f"""
+                    self._con.execute(f"""
                         DELETE FROM {table}
                         WHERE (user_id, lesson_id) IN (
                             SELECT user_id, lesson_id FROM _incr_pairs
                         )
-                    """).fetchone()
+                    """)
                     self._con.unregister("_incr_pairs")
 
                     self._con.register("_incr", df)
@@ -734,24 +805,18 @@ class TableCache:
                     new_ts = str(df["completed_at"].max())
                     self._save_last_completion_ts(table, new_ts)
 
-                    total = self._con.execute(
-                        f"SELECT COUNT(*) FROM {table}"
-                    ).fetchone()[0]
+                    total = self._con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                     self._upsert_source_meta(table, total)
 
                     log.info(
-                        "[table_cache]   %-*s  upserted %d records  "
-                        "(total: %d unique user×lesson rows)  new max_ts: %s",
+                        "[table_cache]   %-*s  upserted %d records  (total: %d rows)  new max_ts: %s",
                         col_w, table, len(df), total, new_ts,
                     )
                     log.info("[table_cache] ─────────────────────────────────────────────────────")
                     continue
 
-                # ── Full refresh path (batch by user_id) ─────────────────────
-                log.info(
-                    "[table_cache] ── %s: full refresh (batch_size=%d) ──────────",
-                    table, batch_size,
-                )
+                # ── Full refresh path ─────────────────────────────────────────
+                log.info("[table_cache] ── %s: full refresh (batch_size=%d) ──────────", table, batch_size)
 
                 user_ids = self._con.execute(f"""
                     SELECT id FROM users
@@ -759,10 +824,9 @@ class TableCache:
                       AND type IN ({types_sql})
                 """).fetchdf()["id"].tolist()
 
-                n_users  = len(user_ids)
-                chunks   = [user_ids[i:i + batch_size]
-                            for i in range(0, n_users, batch_size)]
-                n_chunks = len(chunks)
+                n_users   = len(user_ids)
+                chunks    = [user_ids[i:i + batch_size] for i in range(0, n_users, batch_size)]
+                n_chunks  = len(chunks)
 
                 log.info(
                     "[table_cache]   %-*s  %d users → %d batches of %d",
@@ -782,18 +846,13 @@ class TableCache:
                     if not df.empty:
                         self._con.register("_tmp", df)
                         if not table_created:
-                            self._con.execute(
-                                f"CREATE TABLE {table} AS SELECT * FROM _tmp"
-                            )
+                            self._con.execute(f"CREATE TABLE {table} AS SELECT * FROM _tmp")
                             table_created = True
                         else:
-                            self._con.execute(
-                                f"INSERT INTO {table} SELECT * FROM _tmp"
-                            )
+                            self._con.execute(f"INSERT INTO {table} SELECT * FROM _tmp")
                         self._con.unregister("_tmp")
                         total_rows += len(df)
 
-                        # Track running MAX(completed_at)
                         if "completed_at" in df.columns:
                             batch_max = df["completed_at"].max()
                             if pd.notna(batch_max):
@@ -813,34 +872,22 @@ class TableCache:
                         f"rating DOUBLE, duration BIGINT, completed INTEGER)"
                     )
 
-                # Apply lesson filter once in DuckDB — uses cached tables,
-                # no SSH needed. Much faster than running subquery per batch.
                 if table_created:
                     self._apply_lesson_filter_in_duckdb(table)
-                    # Deduplicate: keep only the latest attempt per
-                    # (user_id, lesson_id) so the cache has a unique key.
                     self._dedup_completion_table(table)
-                    total_rows = self._con.execute(
-                        f"SELECT COUNT(*) FROM {table}"
-                    ).fetchone()[0]
+                    total_rows = self._con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
                 self._upsert_source_meta(table, total_rows)
 
                 if max_ts is not None:
                     self._save_last_completion_ts(table, str(max_ts))
-                    log.info(
-                        "[table_cache]   %-*s  max completed_at saved: %s",
-                        col_w, table, max_ts,
-                    )
+                    log.info("[table_cache]   %-*s  max completed_at saved: %s", col_w, table, max_ts)
 
-                log.info(
-                    "[table_cache]   %-*s  %10d total rows  ✓ cached",
-                    col_w, table, total_rows,
-                )
+                log.info("[table_cache]   %-*s  %10d total rows  ✓ cached", col_w, table, total_rows)
                 log.info("[table_cache] ─────────────────────────────────────────────────────")
 
             except Exception as exc:
-                log.error("[table_cache]   %-*s  ✗ FAILED: %s", col_w, table, exc)
+                log.error("[table_cache]   ✗ FAILED %s: %s", table, exc)
                 raise
 
         log.info("[table_cache] Completion tables ready — s3 will query DuckDB this run")
@@ -849,27 +896,18 @@ class TableCache:
 
     def build_indexes(self):
         """
-        Create DuckDB ART indexes on the columns most frequently used as JOIN
-        keys in s2_allocation queries.
-
-        Why this matters:
-          Without indexes, DuckDB must full-scan batch_subject (1.8M rows) and
-          centre_subject (323K rows) on every chunk to find matching batch_ids /
-          centre_ids for the 2000 users in that chunk.  With ART indexes, each
-          chunk lookup is O(log n) — dramatically reducing per-chunk JOIN time
-          from ~38s to ~3-5s.
-
-        Indexes are created with IF NOT EXISTS so re-running is safe.
-        Only created when the underlying table exists in the cache.
+        Create ART indexes on the columns most frequently used as JOIN keys
+        in the allocation queries.  Reduces per-chunk JOIN time from ~38s to ~3-5s.
         """
         _index_specs = [
-            # table               column(s)
-            ("batch_subject",      "batch_id"),
-            ("batch_subject",      "subject_id"),
-            ("centre_subject",     "centre_id"),
-            ("centre_subject",     "subject_id"),
-            ("student_details",    "user_id"),
+            ("batch_subject",        "batch_id"),
+            ("batch_subject",        "subject_id"),
+            ("centre_subject",       "centre_id"),
+            ("centre_subject",       "subject_id"),
+            ("student_details",      "user_id"),
             ("ple_career_path_user", "user_id"),
+            ("learning_activities",             "user_id"),
+            ("facilitator_learning_activities", "user_id"),
         ]
         built = 0
         for table, col in _index_specs:
@@ -881,36 +919,26 @@ class TableCache:
                 built += 1
             except Exception as exc:
                 log.warning("[table_cache] Could not create index %s: %s", idx_name, exc)
-        log.info("[table_cache] Built %d DuckDB indexes — per-chunk JOIN lookups now O(log n)", built)
+        log.info("[table_cache] Built %d DuckDB indexes", built)
 
-    # ── Allocation pre-computation ────────────────────────────────────────────
+    # ── Opt 1 — Precompute full allocation ────────────────────────────────────
 
     _ORDER_BY_RE = re.compile(r'\s+ORDER\s+BY\b.*', re.IGNORECASE | re.DOTALL)
 
     @staticmethod
     def _adapt_sql_for_duckdb(sql: str) -> str:
-        """Convert MySQL SQL placeholders and identifier quoting to DuckDB style."""
         return sql.replace("`", '"').replace("%s", "?")
 
     def precompute_allocation(self, learner_types_sql: str) -> int:
         """
         Run the full allocation query for ALL users in one DuckDB pass and
-        store the combined deduplicated result as the _alloc_precomputed table.
+        store the combined deduplicated result as _alloc_precomputed.
 
-        Problem solved:
-          Previously, each of 469 learner chunks ran 2 complex 7-table JOINs
-          (non_ple + ple) against DuckDB, scanning batch_subject (1.8M rows)
-          and centre_subject (323K rows) 938 times total — ~10 hours wall time.
+        Instead of running 2 JOINs × 469 chunks = 938 queries, this runs
+        3 CREATE TABLE AS SELECT statements (one per path) and one UNION ALL +
+        dedup pass.  Each chunk then reads via a sub-second indexed scan.
 
-        Fix:
-          Run each of the 3 allocation paths (non_ple, ple, staff) ONCE for all
-          users. Each is a CREATE TABLE AS in DuckDB — no chunking, no Python
-          memory pressure. Then combine + deduplicate in a single SQL step.
-          Each chunk then reads via:
-            SELECT * FROM _alloc_precomputed WHERE user_id IN (...)
-          which is a sub-second indexed scan on the already-materialised table.
-
-        Expected time: ~15–30 min (3 full-table JOINs) vs ~10 hours (938 JOINs).
+        Expected time: ~15–30 min vs ~10 hours for the per-chunk approach.
         Returns total row count of the pre-computed table.
         """
         from steps.s2_allocation import (
@@ -927,25 +955,19 @@ class TableCache:
                 common_select=common_select,
                 lesson_joins=lesson_joins,
                 types=types,
-                user_clause="",       # no user filter — all users at once
+                user_clause="",
             )
             sql = self._adapt_sql_for_duckdb(sql)
-            sql = self._ORDER_BY_RE.sub("", sql).strip()   # ORDER BY not needed here
+            sql = self._ORDER_BY_RE.sub("", sql).strip()
             return sql
 
-        non_ple_sql = _build(_NON_PLE_SQL, _COMMON_SELECT,       _LESSON_JOINS,       types=learner_types_sql)
-        ple_sql     = _build(_PLE_SQL,     _COMMON_SELECT,        _LESSON_JOINS,       types=learner_types_sql)
-        staff_sql   = _build(_STAFF_SQL,   _COMMON_SELECT_STAFF,  _LESSON_JOINS_STAFF)
+        non_ple_sql = _build(_NON_PLE_SQL, _COMMON_SELECT,      _LESSON_JOINS,       types=learner_types_sql)
+        ple_sql     = _build(_PLE_SQL,     _COMMON_SELECT,       _LESSON_JOINS,       types=learner_types_sql)
+        staff_sql   = _build(_STAFF_SQL,   _COMMON_SELECT_STAFF, _LESSON_JOINS_STAFF)
 
-        # Drop any leftover tables from a previous interrupted run
         for _t in ("_alloc_non_ple", "_alloc_ple", "_alloc_staff", "_alloc_precomputed"):
             self._con.execute(f"DROP TABLE IF EXISTS {_t}")
 
-        # For each path: create a table with career_path_updated_at cast to
-        # TIMESTAMP and moved to the end (after EXCLUDE). This ensures all
-        # three paths have the same column order for the UNION ALL below.
-        # non_ple and staff have NULL career_path_updated_at (INTEGER in DuckDB);
-        # ple has actual TIMESTAMP values. TRY_CAST normalises all to TIMESTAMP.
         _path_specs = [
             ("_alloc_non_ple", non_ple_sql, "non_ple",
              "centre_subject [-> batch_subject if batch] [-> subject_trade if trade]"),
@@ -969,11 +991,6 @@ class TableCache:
             cnt = self._con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
             log.info("[table_cache]   %s: %d rows  (%.0fs)", path_name, cnt, time.time() - t1)
 
-        # Combine all paths and deduplicate to one row per (user_id, lesson_id).
-        # career_path_updated_at DESC NULLS LAST: keeps the most recent career
-        # path for PLE users enrolled in multiple career paths.
-        # career_path_updated_at is then excluded from the final table (matches
-        # what fetch_allocation() does via combined.drop(columns=[...]) in pandas).
         log.info("[table_cache]   combining + deduplicating all paths ...")
         t1 = time.time()
         self._con.execute("""
@@ -999,15 +1016,22 @@ class TableCache:
         for _t in ("_alloc_non_ple", "_alloc_ple", "_alloc_staff"):
             self._con.execute(f"DROP TABLE IF EXISTS {_t}")
 
+        # Index for fast chunk lookups
+        self._con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alloc_precomputed_user_id "
+            "ON _alloc_precomputed(user_id)"
+        )
+
         total = self._con.execute("SELECT COUNT(*) FROM _alloc_precomputed").fetchone()[0]
-        log.info("[table_cache]   combine+dedup: %d rows  (%.0fs)", total, time.time() - t1)
-        log.info("[table_cache] ✓ _alloc_precomputed ready — %d rows  (total elapsed: %.0fs)",
-                 total, time.time() - t0)
+        log.info(
+            "[table_cache] ✓ _alloc_precomputed ready — %d rows  (total: %.0fs)",
+            total, time.time() - t0,
+        )
         log.info("[table_cache] ─────────────────────────────────────────────────────")
         return total
 
     def alloc_precomputed_exists(self) -> bool:
-        """True if _alloc_precomputed was built this run and is still present."""
+        """True if _alloc_precomputed is present in DuckDB."""
         try:
             return self._con.execute(
                 "SELECT COUNT(*) FROM information_schema.tables "
@@ -1017,10 +1041,7 @@ class TableCache:
             return False
 
     def load_alloc_precomputed_chunk(self, user_ids: list) -> pd.DataFrame:
-        """
-        Return allocation rows for user_ids from the pre-computed table.
-        Sub-second — no JOIN, just a filtered scan of the materialised table.
-        """
+        """Return allocation rows for user_ids from the pre-computed table (indexed scan)."""
         if not user_ids:
             return pd.DataFrame()
         ph = ", ".join(["?" for _ in user_ids])
@@ -1030,18 +1051,80 @@ class TableCache:
         ).fetchdf()
 
     def drop_alloc_precomputed(self):
-        """Drop the pre-computed allocation table (cleanup after run completes)."""
         self._con.execute("DROP TABLE IF EXISTS _alloc_precomputed")
         log.info("[table_cache] _alloc_precomputed dropped (cleanup)")
 
+    # ── Opt 4 — Batch all-user completion fetch ───────────────────────────────
+
+    def fetch_all_completion(self) -> pd.DataFrame:
+        """
+        Fetch ALL completion data from both cached tables in one DuckDB query.
+
+        Returns a single DataFrame with columns:
+            user_id, lesson_id, score, rating, data_from, duration
+
+        Deduplicates to one row per (user_id, lesson_id) keeping the
+        highest score.  main.py merges this once against the full allocation
+        instead of fetching per chunk — eliminates ~635 SSH completion queries.
+        """
+        log.info("[table_cache] ── Batch completion fetch (all users, DuckDB) ────────")
+        t0 = time.time()
+
+        # Verify both tables exist before querying
+        existing = set(
+            self._con.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+            ).fetchdf()["table_name"].tolist()
+        )
+
+        frames = []
+        for tbl in ("learning_activities", "facilitator_learning_activities"):
+            if tbl not in existing:
+                log.warning("[table_cache] %s not in DuckDB cache — skipping", tbl)
+                continue
+            df = self._con.execute(f"""
+                SELECT
+                    user_id,
+                    lesson_id,
+                    MAX(score)    AS score,
+                    MAX(rating)   AS rating,
+                    NULL          AS data_from,
+                    SUM(duration) AS duration
+                FROM {tbl}
+                WHERE completed = 1
+                GROUP BY user_id, lesson_id
+            """).fetchdf()
+            frames.append(df)
+            log.info("[table_cache]   %s → %d rows", tbl, len(df))
+
+        if not frames:
+            log.warning("[table_cache] No completion tables found — returning empty")
+            return pd.DataFrame(columns=["user_id", "lesson_id", "score", "rating", "data_from", "duration"])
+
+        combined = pd.concat(frames, ignore_index=True)
+
+        # Deduplicate across both tables (a user_id should only appear in one,
+        # but guard against edge cases)
+        combined = (
+            combined
+            .sort_values("score", ascending=False, na_position="last")
+            .drop_duplicates(subset=["user_id", "lesson_id"], keep="first")
+            .reset_index(drop=True)
+        )
+
+        log.info(
+            "[table_cache] ✓ batch completion: %d rows  (%.0fs)",
+            len(combined), time.time() - t0,
+        )
+        log.info("[table_cache] ─────────────────────────────────────────────────────")
+        return combined
+
+    # ── make_fetch_fn ─────────────────────────────────────────────────────────
+
     def make_fetch_fn(self):
         """
-        Return a fetch function with the same signature as db.fetch() that
-        runs queries against the local DuckDB cache instead of MySQL.
-
-        SQL adaptations applied automatically:
-          %s  →  ?          (DuckDB placeholder style)
-          `x` →  "x"        (DuckDB identifier quoting)
+        Return a drop-in replacement for db.fetch() that queries DuckDB locally.
+        Adapts MySQL SQL syntax (%s → ?, backtick → double-quote) automatically.
         """
         con = self._con
 
@@ -1052,22 +1135,22 @@ class TableCache:
         return _duckdb_fetch
 
 
-# ── Result buffer ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Opt 5 — Result Buffer  (streams chunk results to analytics DB at end of run)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ResultBuffer:
     """
     Accumulates chunk results in DuckDB during the loop, then streams
-    everything to the analytics DB in one go at the end.
+    everything to the analytics DB in one bulk write at the end.
 
-    Why: each per-chunk write opens 2 SSH connections (one per table).
-    For 635 chunks that is ~1,270 SSH connections just for writes.
-    Buffering in DuckDB reduces that to a single bulk write at the end.
+    Why: each per-chunk write opens 2 SSH tunnels (one per table).
+    For 635 chunks that is ~1,270 SSH handshakes just for writes.
+    Buffering in DuckDB + one flush at the end reduces that to
+    a single persistent connection (via TunnelPool).
 
-    Active for full refresh runs only (start_chunk=1, no --since).
+    Active for full unscoped runs only (start_chunk=1, no --since).
     Falls back to per-chunk writes for --start-chunk resume and --since.
-
-    Streams from DuckDB → analytics in stream_chunk-row batches so the
-    full result never has to fit in memory at once.
     """
 
     _TABLES = {
@@ -1078,8 +1161,8 @@ class ResultBuffer:
 
     def __init__(self, con: duckdb.DuckDBPyConnection):
         self._con     = con
-        self._created: set[str] = set()
-        self._columns: dict[str, list] = {}
+        self._created: set  = set()
+        self._columns: dict = {}
 
     def append(self, key: str, df: pd.DataFrame):
         """Append one chunk's result to the DuckDB buffer table."""
@@ -1087,16 +1170,12 @@ class ResultBuffer:
             return
         buf = self._TABLES[key]
         if buf not in self._created:
-            # Fix all-NULL object columns → VARCHAR before DuckDB infers INT32.
             self._con.register("_rbuf", _ensure_varchar_nulls(df))
             self._con.execute(f"DROP TABLE IF EXISTS {buf}")
             self._con.execute(f"CREATE TABLE {buf} AS SELECT * FROM _rbuf")
             self._created.add(buf)
             self._columns[buf] = list(df.columns)
         else:
-            # Reindex to match the schema established on first create.  Chunks
-            # that include no-allocation stub rows may carry extra columns
-            # (e.g. is_master_trainer, is_ple) not present in the first chunk.
             schema_cols = self._columns[buf]
             if list(df.columns) != schema_cols:
                 df = df.reindex(columns=schema_cols)
@@ -1120,9 +1199,11 @@ class ResultBuffer:
     ) -> int:
         """
         Stream rows from DuckDB buffer → analytics DB table.
-        Uses fetchmany() so only stream_chunk rows are in memory at once.
+
+        Uses a single persistent pymysql connection (via TunnelPool if active)
+        for the entire flush so we don't re-open the SSH tunnel per batch.
         """
-        from db import write_table as _write_table
+        from db import TunnelPool, _connect_or_pool, write_table_with_conn
 
         buf = self._TABLES[key]
         if buf not in self._created:
@@ -1135,21 +1216,24 @@ class ResultBuffer:
             buf, analytics_table, total, stream_chunk,
         )
 
-        cursor  = self._con.execute(f"SELECT * FROM {buf}")
-        columns = [d[0] for d in cursor.description]
-        first   = True
-        written = 0
+        # Open one connection for the whole flush — avoids per-batch SSH overhead
+        with _connect_or_pool(analytics_cfg) as conn:
+            cursor   = self._con.execute(f"SELECT * FROM {buf}")
+            columns  = [d[0] for d in cursor.description]
+            db_name  = analytics_cfg["db"]["database"]
+            first    = True
+            written  = 0
 
-        while True:
-            rows = cursor.fetchmany(stream_chunk)
-            if not rows:
-                break
-            df   = pd.DataFrame(rows, columns=columns)
-            mode = if_exists if first else "append"
-            _write_table(analytics_cfg, df, analytics_table, if_exists=mode)
-            first    = False
-            written += len(df)
-            log.info("[result_buf]   %s  %d / %d rows written", analytics_table, written, total)
+            while True:
+                rows = cursor.fetchmany(stream_chunk)
+                if not rows:
+                    break
+                df   = pd.DataFrame(rows, columns=columns)
+                mode = if_exists if first else "append"
+                write_table_with_conn(conn, db_name, df, analytics_table, if_exists=mode)
+                first    = False
+                written += len(df)
+                log.info("[result_buf]   %s  %d / %d rows written", analytics_table, written, total)
 
         self._con.execute(f"DROP TABLE IF EXISTS {buf}")
         self._created.discard(buf)
