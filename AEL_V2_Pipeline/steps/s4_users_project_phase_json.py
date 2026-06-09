@@ -230,14 +230,40 @@ def _where_clause(
     return where_clause, tuple(params) if params else None
 
 
-def fetch_first_login(user_ids: list) -> pd.DataFrame:
-    """Fetch MIN(created_at) per user from production login_logs."""
+def fetch_first_login(user_ids: list, batch_size: int = 500) -> pd.DataFrame:
+    """
+    Fetch MIN(created_at) per user from production login_logs.
+
+    Opt 9 — batches the IN clause in groups of `batch_size` (default 500).
+    MySQL query planner degrades with large IN lists (thousands of UUIDs);
+    batching keeps each query fast and avoids packet-size limits.
+    Results are unioned and re-aggregated so the output is identical to
+    a single query.
+    """
     if not user_ids:
         return pd.DataFrame(columns=["tlo_users_id", "first_login"])
-    placeholders = ", ".join(["%s"] * len(user_ids))
-    sql = _LOGIN_SQL.format(placeholders=placeholders)
-    df = fetch(SOURCE_DB, sql, tuple(user_ids))
-    log.info("[s4_users_project_phase_json] fetched first_login for %d users", len(df))
+
+    frames = []
+    for i in range(0, len(user_ids), batch_size):
+        batch = user_ids[i : i + batch_size]
+        placeholders = ", ".join(["%s"] * len(batch))
+        sql = _LOGIN_SQL.format(placeholders=placeholders)
+        frames.append(fetch(SOURCE_DB, sql, tuple(batch)))
+
+    if not frames:
+        return pd.DataFrame(columns=["tlo_users_id", "first_login"])
+
+    df = pd.concat(frames, ignore_index=True)
+
+    # Re-aggregate in case a user appears in multiple batches (shouldn't happen,
+    # but guards against edge cases with duplicate user_ids in the input list).
+    df = (
+        df.groupby("tlo_users_id", as_index=False)
+        .agg(first_login=("first_login", "min"))
+    )
+
+    log.info("[s4_users_project_phase_json] fetched first_login for %d users (%d batches)",
+             len(df), len(frames))
     return df
 
 
