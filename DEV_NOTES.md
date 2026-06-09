@@ -27,6 +27,94 @@ Output: DB tables in `quest_ple_analytics` (default) and/or CSV files.
 
 ---
 
+### 2026-06-09 — Storage Optimisation: `main_wcc_json_v2` table (~4 GB → ~400 MB)
+
+**Problem:** The `main_wcc_json_v2` table grew to ~4 GB after the first full run. Root causes:
+
+| Cause | Impact |
+|---|---|
+| `sub_name` (avg 50 chars) stored in every subject JSON object | ~200 MB just for names on 100k users |
+| Verbose JSON keys (`"c_sub_w_less_asse_c"` = 20 chars) × 10 keys × 35 subjects × all users | ~600 MB of key overhead |
+| `json.dumps()` with default whitespace (`", "` / `": "`) | ~10% extra bytes |
+| `subject_combos` typed as `LONGTEXT` | MySQL stores off-page with no compression |
+| `ROW_FORMAT=DYNAMIC` (default) | No InnoDB page compression |
+
+**Measured savings per user (35 subjects, real key names):**
+- OLD verbose JSON: **11.5 KB/user**
+- NEW compact JSON (no `sub_name`, short keys, no whitespace): **3.7 KB/user** — **67.6% reduction**
+- With `ROW_FORMAT=COMPRESSED`: estimated **~1.8 KB/user** stored on disk
+
+**Projected table size at 100k users:**
+
+| Version | Raw JSON | On disk (compressed) |
+|---|---|---|
+| Before | ~4 GB | ~4 GB |
+| After | ~0.35 GB | ~0.17 GB |
+
+**Changes made:**
+
+#### 1. `sub_name` removed from `subject_combos` JSON (`steps/s4_users_project_phase_json.py`)
+
+Removed `subject_name AS sub_name` from `_SUBJECT_SQL` and removed `"sub_name"` from `SUBJECT_COLS`. Consumers who need the subject name look it up from `main_learning_activity_myquest_ael` or a subjects reference table using `sub_id` as the key. Subject UUIDs are stable — this is a safe change.
+
+#### 2. Compact JSON key map (`steps/s4_users_project_phase_json.py`)
+
+Added `_SUBJECT_KEY_MAP` and `_PHASE_KEY_MAP` dicts that map long column names to single/double-char keys:
+```python
+_SUBJECT_KEY_MAP = {
+    "sub_id":              "i",   # subject UUID
+    "avg_score_a":         "s",   # avg score
+    "avg_rating_a":        "r",   # avg rating
+    "c_sub_w_less_asse_c": "c",   # completed total
+    "a_sub_w_less_asse_c": "a",   # allocated total
+    "a_sub_w_assess_c":    "aa",  # allocated assessments
+    "a_sub_w_lesson_c":    "al",  # allocated lessons
+    "c_sub_w_assess_c":    "ca",  # completed assessments
+    "c_sub_w_less_c":      "cl",  # completed lessons
+    "year_category":       "y",   # year_to_map
+}
+```
+**Rule: key map is append-only** — never rename or remove existing keys, only add new ones. Consumers decode using the map. Old keys would break existing consumers if changed.
+
+#### 3. `_records_to_compact_json()` replaces `_records_to_json()` (`steps/s4_users_project_phase_json.py`)
+
+New function applies the key map and uses `separators=(',', ':')` to strip whitespace from JSON output. Old `_records_to_json()` kept as an alias so nothing breaks.
+
+#### 4. Integer counts serialised as int, not float (`_make_json_safe`)
+
+`12.0` → `12`. Saves 2 bytes per count value × 6 count fields × 35 subjects × all users (~25 MB at 100k users).
+
+#### 5. `LONGTEXT` → `MEDIUMTEXT` + `ROW_FORMAT=COMPRESSED` (`main_wcc_json_v2.py`)
+
+Changed `_SCHEMA_STATEMENTS`:
+- `subject_combos MEDIUMTEXT` — max 16 MB per cell (more than enough for any user's subjects; LONGTEXT was overkill)
+- `ROW_FORMAT=COMPRESSED, KEY_BLOCK_SIZE=8` — InnoDB compresses each 8 KB page with zlib; ~50% additional reduction on top of compact JSON
+
+The ALTER TABLE runs after every `write_table(if_exists='replace')`, so the table is always compressed.
+
+#### 6. Payload size logged after every run
+
+`build_subject_json()` now logs:
+```
+[s4] subject_combos: avg 3742 bytes/user, total payload 356.3 MB for 95,200 users
+```
+Makes storage regressions immediately visible in run logs without needing to query MySQL.
+
+**How to apply to existing table (run once on the server):**
+```sql
+-- After next pipeline run (which will recreate the table with new schema),
+-- the compression is applied automatically.
+-- To compress the existing 4 GB table right now without waiting:
+ALTER TABLE `main_wcc_json_v2`
+    MODIFY `subject_combos` MEDIUMTEXT,
+    ROW_FORMAT=COMPRESSED,
+    KEY_BLOCK_SIZE=8;
+-- This rebuilds the table in-place (~5–10 min, table remains readable).
+-- Then run main_wcc_json_v2.py to repopulate with compact JSON.
+```
+
+---
+
 ### 2026-06-09 — Performance Optimisation Pass (8 improvements)
 
 **Context:** After the DuckDB cache was working correctly, profiling revealed the pipeline still took ~10 hours on a full 635-chunk run because:

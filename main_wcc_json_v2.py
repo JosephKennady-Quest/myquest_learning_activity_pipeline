@@ -27,9 +27,13 @@ log = logging.getLogger("main_wcc_json_v2")
 
 DEFAULT_TARGET_TABLE = "main_wcc_json_v2"
 
-# ── Schema applied after every full write (opt 8) ────────────────────────────
-# Keeping these here makes it easy to add / remove columns without touching
-# the write logic.  run_sql() is idempotent for CREATE INDEX IF NOT EXISTS.
+# ── Schema applied after every full write (opt 8 + storage fix) ──────────────
+# subject_combos changed from LONGTEXT → MEDIUMTEXT:
+#   - MEDIUMTEXT max = 16 MB per cell — more than enough for any user's subjects
+#   - Avoids MySQL's expensive off-page LONGTEXT storage overhead
+# ROW_FORMAT=COMPRESSED: MySQL InnoDB compresses each 8KB page with zlib (~50%
+#   reduction on JSON-heavy rows). Combined with compact JSON keys this brings
+#   the table from ~4 GB to ~400–600 MB.
 _SCHEMA_STATEMENTS = [
     """ALTER TABLE `{t}`
         MODIFY `tlo_users_id`         VARCHAR(36),
@@ -49,7 +53,7 @@ _SCHEMA_STATEMENTS = [
         MODIFY `is_ple`                VARCHAR(1),
         MODIFY `ple_enabled`           VARCHAR(15),
         MODIFY `project_phase_combos`  TEXT,
-        MODIFY `subject_combos`        LONGTEXT,
+        MODIFY `subject_combos`        MEDIUMTEXT,
         MODIFY `a_overa_less_asses_c`  INT,
         MODIFY `a_overa_assess_c`      INT,
         MODIFY `a_overa_lesson_c`      INT,
@@ -57,7 +61,9 @@ _SCHEMA_STATEMENTS = [
         MODIFY `c_overa_asse_c`        INT,
         MODIFY `c_overa_less_c`        INT,
         MODIFY `rounded_completion`    DECIMAL(10,2),
-        MODIFY `first_login`           DATE""",
+        MODIFY `first_login`           DATE,
+        ROW_FORMAT=COMPRESSED,
+        KEY_BLOCK_SIZE=8""",
     "CREATE INDEX IF NOT EXISTS `idx_tlo_users_id` ON `{t}` (`tlo_users_id`)",
 ]
 
