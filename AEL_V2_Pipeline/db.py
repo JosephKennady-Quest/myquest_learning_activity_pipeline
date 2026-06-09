@@ -278,3 +278,13 @@ def write_table(
 
     log.info("write_table → %d rows written to %s.%s",
              len(df), cfg["db"]["database"], table)
+
+
+def run_sql(cfg: Dict[str, Any], statements: list[str]) -> None:
+    """Execute one or more SQL statements (DDL/DML) through an SSH tunnel."""
+    with _connect(cfg) as conn:
+        with conn.cursor() as cur:
+            for sql in statements:
+                log.debug("run_sql: %s", sql[:120])
+                cur.execute(sql)
+        conn.commit()

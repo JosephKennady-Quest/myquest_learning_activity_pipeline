@@ -374,4 +374,24 @@ def run_users_project_phase_json(
     final_df = final_df.merge(login_df, on="tlo_users_id", how="left")
 
     final_df = final_df.replace({np.nan: None})
+
+    # ── Type cleanup ─────────────────────────────────────────────────────────
+    # Strip time component — store date only.
+    for col in ("created_at", "first_login"):
+        if col in final_df.columns:
+            final_df[col] = pd.to_datetime(final_df[col], errors="coerce").dt.date
+
+    # Round completion to 2 decimal places.
+    if "rounded_completion" in final_df.columns:
+        final_df["rounded_completion"] = (
+            pd.to_numeric(final_df["rounded_completion"], errors="coerce")
+            .round(2)
+        )
+
+    # Numeric overall columns — store as integer.
+    int_cols = [c for c in OVERALL_COLS if c != "rounded_completion"]
+    for col in int_cols:
+        if col in final_df.columns:
+            final_df[col] = pd.to_numeric(final_df[col], errors="coerce").astype("Int64")
+
     return final_df

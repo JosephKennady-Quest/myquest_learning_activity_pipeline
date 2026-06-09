@@ -13,7 +13,7 @@ from datetime import datetime
 import pandas as pd
 
 from config import ANALYTICS_DB, OUTPUT_DIR
-from db import write_table
+from db import write_table, run_sql
 from steps.s4_users_project_phase_json import run_users_project_phase_json
 
 logging.basicConfig(
@@ -100,6 +100,40 @@ def main():
             ANALYTICS_DB["db"]["database"],
             args.target_table,
         )
+
+        t = f"`{args.target_table}`"
+        log.info("Optimising table schema and creating index …")
+        run_sql(ANALYTICS_DB, [
+            f"""ALTER TABLE {t}
+                MODIFY `tlo_users_id`         VARCHAR(36),
+                MODIFY `user_name`             VARCHAR(250),
+                MODIFY `gender`                VARCHAR(12),
+                MODIFY `created_at`            DATE,
+                MODIFY `centre_name`           VARCHAR(100),
+                MODIFY `org_name`              VARCHAR(70),
+                MODIFY `state_name`            VARCHAR(25),
+                MODIFY `district_name`         VARCHAR(35),
+                MODIFY `trade`                 VARCHAR(60),
+                MODIFY `batch_name`            VARCHAR(90),
+                MODIFY `batch_status`          VARCHAR(12),
+                MODIFY `centre_type`           VARCHAR(35),
+                MODIFY `user_type`             VARCHAR(15),
+                MODIFY `platform`              VARCHAR(20),
+                MODIFY `is_ple`                VARCHAR(1),
+                MODIFY `ple_enabled`           VARCHAR(15),
+                MODIFY `project_phase_combos`  TEXT,
+                MODIFY `subject_combos`        LONGTEXT,
+                MODIFY `a_overa_less_asses_c`  INT,
+                MODIFY `a_overa_assess_c`      INT,
+                MODIFY `a_overa_lesson_c`      INT,
+                MODIFY `c_overa_less_asses_c`  INT,
+                MODIFY `c_overa_asse_c`        INT,
+                MODIFY `c_overa_less_c`        INT,
+                MODIFY `rounded_completion`    DECIMAL(10,2),
+                MODIFY `first_login`           DATE""",
+            f"CREATE INDEX `idx_tlo_users_id` ON {t} (`tlo_users_id`)",
+        ])
+        log.info("Schema optimisation and index creation complete.")
 
 
 if __name__ == "__main__":
