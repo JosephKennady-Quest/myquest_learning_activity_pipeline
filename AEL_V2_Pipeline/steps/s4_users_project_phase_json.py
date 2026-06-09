@@ -45,14 +45,7 @@ PREFERRED_USER_COLS = [
     "platform",
     "is_ple",
     "ple_enabled",
-    "a_overa_less_asses_c",
-    "a_overa_assess_c",
-    "a_overa_lesson_c",
-    "c_overa_less_asses_c",
-    "c_overa_asse_c",
-    "c_overa_less_c",
     "first_login",
-    "rounded_completion",
 ]
 
 # Keep project_phase_combos aligned with the existing WCC JSON notebook.
@@ -64,6 +57,7 @@ PROJECT_PHASE_COLS = [
     "phase",
 ]
 
+# Subject-level columns collapsed into subject_combos JSON array.
 SUBJECT_COLS = [
     "sub_id",
     "sub_name",
@@ -76,6 +70,18 @@ SUBJECT_COLS = [
     "c_sub_w_assess_c",
     "c_sub_w_less_c",
     "year_category",
+]
+
+# User-level overall columns from main_learning_activity_myquest_ael —
+# same value for every subject row of a user, emitted as flat output columns.
+OVERALL_COLS = [
+    "a_overa_less_asses_c",
+    "a_overa_assess_c",
+    "a_overa_lesson_c",
+    "c_overa_less_asses_c",
+    "c_overa_asse_c",
+    "c_overa_less_c",
+    "rounded_completion",
 ]
 
 _PROJECT_PHASE_SQL = """
@@ -122,7 +128,14 @@ SELECT
     subj_lessons_allocated        AS a_sub_w_lesson_c,
     subj_assessments_completed    AS c_sub_w_assess_c,
     subj_lessons_completed        AS c_sub_w_less_c,
-    year_to_map                   AS year_category
+    year_to_map                   AS year_category,
+    total_allocated	              AS a_overa_less_asses_c,
+    total_assessments_allocated	  AS a_overa_assess_c,
+    total_lessons_allocated	      AS a_overa_lesson_c,
+    total_completed	              AS c_overa_less_asses_c,
+    total_assessments_completed	  AS c_overa_asse_c,
+    total_lessons_completed	      AS c_overa_less_c,
+    completion_pct                AS rounded_completion
 FROM quest_analytics.main_learning_activity_myquest_ael
 {where_clause}
 """
@@ -275,8 +288,9 @@ def build_users_project_phase_json(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_subject_json(df: pd.DataFrame) -> pd.DataFrame:
+    """Returns subject_combos JSON + flat overall columns, one row per user."""
     if df.empty:
-        return pd.DataFrame(columns=["tlo_user_id", "subject_combos"])
+        return pd.DataFrame(columns=["tlo_user_id", "subject_combos"] + OVERALL_COLS)
 
     missing_subject_cols = [col for col in ["tlo_user_id"] + SUBJECT_COLS if col not in df.columns]
     if missing_subject_cols:
@@ -289,8 +303,19 @@ def build_subject_json(df: pd.DataFrame) -> pd.DataFrame:
         .apply(_records_to_json)
         .reset_index(name="subject_combos")
     )
-    subject_df = subject_df.replace({np.nan: None})
     subject_df["subject_combos"] = subject_df["subject_combos"].replace("", None)
+
+    # Extract overall (user-level) columns — same value across all subject rows
+    # for a given user, so just take the first occurrence per user.
+    overall_cols_present = [c for c in OVERALL_COLS if c in df.columns]
+    if overall_cols_present:
+        overall_df = (
+            df[["tlo_user_id"] + overall_cols_present]
+            .drop_duplicates(subset=["tlo_user_id"], keep="first")
+        )
+        subject_df = subject_df.merge(overall_df, on="tlo_user_id", how="left")
+
+    subject_df = subject_df.replace({np.nan: None})
     log.info("[s4_users_project_phase_json] built %d subject JSON rows", len(subject_df))
     return subject_df
 

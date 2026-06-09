@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("main_wcc_json_v2")
 
-DEFAULT_TARGET_TABLE = "main_wcc_json"
+DEFAULT_TARGET_TABLE = "main_wcc_json_v2"
 
 
 def parse_args():
