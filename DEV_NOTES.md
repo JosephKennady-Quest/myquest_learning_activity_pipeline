@@ -27,6 +27,56 @@ Output: DB tables in `quest_ple_analytics` (default) and/or CSV files.
 
 ---
 
+### 2026-06-10 — Bug Fix: PLE allocation precompute fails with `Parser Error: syntax error at end of input`
+
+**Symptom:**
+
+After `non_ple` allocation precomputed successfully (368M rows, ~3.7 hours), the pipeline crashed during the `ple` step:
+
+```
+_duckdb.ParserException: Parser Error: syntax error at end of input
+```
+
+at `s0_cache.py → precompute_allocation() → self._con.execute(CREATE TABLE _alloc_ple AS ...)`.
+
+**Root cause:**
+
+`_ORDER_BY_RE = re.compile(r'\s+ORDER\s+BY\b.*', re.IGNORECASE | re.DOTALL)`
+
+This regex was used to strip the trailing `ORDER BY` from each allocation SQL before wrapping it in `CREATE TABLE AS SELECT * FROM (...) AS _q`.
+
+The `.*` with `re.DOTALL` is **greedy and matches newlines**, so it consumes from the **first** `ORDER BY` to the end of the string.
+
+`_PLE_SQL` (in `s2_allocation.py`) contains an `ORDER BY updated_at DESC` **inside a subquery** (the `pcpu` derived table for career path deduplication, around line 196). The regex matched that inner `ORDER BY` and stripped everything after it — all the remaining JOINs, WHERE clause, and outer ORDER BY — leaving a truncated, invalid SQL fragment.
+
+`_NON_PLE_SQL` and `_STAFF_SQL` have only one `ORDER BY` each (at the very end), so they were unaffected.
+
+**Fix (`steps/s0_cache.py`):**
+
+Replaced the broken `_ORDER_BY_RE.sub("", sql)` call with a new static method `_strip_trailing_order_by(sql)`:
+
+```python
+@staticmethod
+def _strip_trailing_order_by(sql: str) -> str:
+    """Remove only the top-level trailing ORDER BY (not ones inside subqueries)."""
+    import re
+    pattern = re.compile(r'\bORDER\s+BY\b', re.IGNORECASE)
+    matches = list(pattern.finditer(sql))
+    for m in reversed(matches):
+        depth = sql[:m.start()].count('(') - sql[:m.start()].count(')')
+        if depth == 0:
+            return sql[:m.start()].rstrip()
+    return sql
+```
+
+Walks `ORDER BY` occurrences from the end. The first one found at paren depth 0 is the top-level trailing `ORDER BY` — strip from there. The inner subquery's `ORDER BY` has depth > 0 and is left intact.
+
+**Impact:** `non_ple` was already unaffected (only one `ORDER BY`). `ple` now correctly precomputes. `staff` is also unaffected.
+
+**Time lost:** ~3.7 hours of compute (non_ple ran fine, crash happened at the start of ple). Next run should complete all three in the expected ~15–30 min.
+
+---
+
 ### 2026-06-09 — Storage Optimisation: `main_wcc_json_v2` table (~4 GB → ~400 MB)
 
 **Problem:** The `main_wcc_json_v2` table grew to ~4 GB after the first full run. Root causes:

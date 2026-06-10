@@ -1430,6 +1430,10 @@ Use incremental mode (`--since`) for daily updates. Full refresh for 900K+ users
 
 You need VPN or office network connectivity to reach the bastion hosts (`SOURCE_SSH_HOST`, `DEST_SSH_HOST` in `.env`).
 
+**`_duckdb.ParserException: Parser Error: syntax error at end of input` during `precompute_allocation`**
+
+This was caused by a greedy regex (`re.DOTALL`) stripping the `ORDER BY` inside the `_PLE_SQL` subquery (career path deduplication) instead of only the trailing top-level `ORDER BY`. Fixed in `s0_cache.py` — `_strip_trailing_order_by()` now walks `ORDER BY` occurrences from the end and only removes the one at paren depth 0.
+
 **`ModuleNotFoundError`**
 
 ```bash

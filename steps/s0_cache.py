@@ -926,6 +926,20 @@ class TableCache:
     _ORDER_BY_RE = re.compile(r'\s+ORDER\s+BY\b.*', re.IGNORECASE | re.DOTALL)
 
     @staticmethod
+    def _strip_trailing_order_by(sql: str) -> str:
+        """Remove only the top-level trailing ORDER BY (not ones inside subqueries)."""
+        import re
+        # Walk backwards through ORDER BY occurrences and remove the last one
+        # whose position is not inside a subquery (paren depth == 0).
+        pattern = re.compile(r'\bORDER\s+BY\b', re.IGNORECASE)
+        matches = list(pattern.finditer(sql))
+        for m in reversed(matches):
+            depth = sql[:m.start()].count('(') - sql[:m.start()].count(')')
+            if depth == 0:
+                return sql[:m.start()].rstrip()
+        return sql
+
+    @staticmethod
     def _adapt_sql_for_duckdb(sql: str) -> str:
         return sql.replace("`", '"').replace("%s", "?")
 
@@ -958,7 +972,7 @@ class TableCache:
                 user_clause="",
             )
             sql = self._adapt_sql_for_duckdb(sql)
-            sql = self._ORDER_BY_RE.sub("", sql).strip()
+            sql = self._strip_trailing_order_by(sql)
             return sql
 
         non_ple_sql = _build(_NON_PLE_SQL, _COMMON_SELECT,      _LESSON_JOINS,       types=learner_types_sql)
