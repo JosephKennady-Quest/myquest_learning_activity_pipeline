@@ -921,6 +921,190 @@ class TableCache:
                 log.warning("[table_cache] Could not create index %s: %s", idx_name, exc)
         log.info("[table_cache] Built %d DuckDB indexes", built)
 
+    # ── Two-stage precompute: user × subject map ──────────────────────────────
+
+    def precompute_user_subject_map(self, learner_types_sql: str) -> int:
+        """
+        Stage 1 of two-stage precompute.
+
+        Runs the three allocation queries WITHOUT the lessons JOIN, producing a
+        _user_subject_map table (~21 M rows) instead of the full user × lesson
+        table (~370 M rows).  Takes ~5 minutes instead of >1 hour.
+
+        Stage 2 happens per-chunk in load_alloc_for_chunk(): a fast indexed
+        DuckDB JOIN of _user_subject_map with lessons for ~2 000 users.
+        """
+        from steps.s2_allocation import (
+            _NON_PLE_SQL, _PLE_SQL,
+            _SUBJECT_SELECT, _SUBJECT_JOINS,
+            _STAFF_SUBJECT_SQL,
+        )
+
+        log.info("[table_cache] ── Building user×subject map (stage-1 precompute) ──────")
+        t0 = time.time()
+
+        def _build_learner(template, path_name, basis):
+            extra = f"\n    NULL                        AS is_master_trainer,"
+            sql = template.format(
+                common_select=extra + _SUBJECT_SELECT
+                    + f"\n    '{path_name}'               AS allocation_path,"
+                    + f"\n    '{basis}'                   AS allocation_basis",
+                lesson_joins=_SUBJECT_JOINS,
+                types=learner_types_sql,
+                user_clause="",
+            )
+            sql = self._adapt_sql_for_duckdb(sql)
+            return self._strip_trailing_order_by(sql)
+
+        non_ple_sql = _build_learner(
+            _NON_PLE_SQL, "non_ple",
+            "centre_subject [-> batch_subject if batch] [-> subject_trade if trade]",
+        )
+        ple_sql = _build_learner(
+            _PLE_SQL, "ple",
+            "centre_subject [-> subject_ple_career_path if career_path] [-> batch_subject if batch]",
+        )
+        staff_sql = self._adapt_sql_for_duckdb(
+            self._strip_trailing_order_by(
+                _STAFF_SUBJECT_SQL.format(user_clause="")
+            )
+        )
+
+        for tbl in ("_usm_non_ple", "_usm_ple", "_usm_staff", "_user_subject_map"):
+            self._con.execute(f"DROP TABLE IF EXISTS {tbl}")
+
+        path_specs = [
+            ("_usm_non_ple", non_ple_sql, "non_ple"),
+            ("_usm_ple",     ple_sql,     "ple"),
+            ("_usm_staff",   staff_sql,   "staff"),
+        ]
+        for tbl, sql, path in path_specs:
+            log.info("[table_cache]   %s: building subject map ...", path)
+            t1 = time.time()
+            self._con.execute(
+                "CREATE TABLE " + tbl + " AS "
+                "SELECT * EXCLUDE (career_path_updated_at), "
+                "       TRY_CAST(career_path_updated_at AS TIMESTAMP) AS career_path_updated_at, "
+                "       TRY_CAST(is_master_trainer AS INTEGER)        AS is_master_trainer "
+                "FROM (" + sql + ") _q"
+            )
+            cnt = self._con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            log.info("[table_cache]   %s: %d rows  (%.0fs)", path, cnt, time.time() - t1)
+
+        log.info("[table_cache]   combining paths → _user_subject_map ...")
+        self._con.execute("""
+            CREATE TABLE _user_subject_map AS
+            SELECT * FROM _usm_non_ple
+            UNION ALL
+            SELECT * FROM _usm_ple
+            UNION ALL
+            SELECT * FROM _usm_staff
+        """)
+        for tbl in ("_usm_non_ple", "_usm_ple", "_usm_staff"):
+            self._con.execute(f"DROP TABLE IF EXISTS {tbl}")
+
+        self._con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usm_user_id ON _user_subject_map(user_id)"
+        )
+        total = self._con.execute("SELECT COUNT(*) FROM _user_subject_map").fetchone()[0]
+        log.info(
+            "[table_cache] _user_subject_map ready — %d rows  (%.0fs total)",
+            total, time.time() - t0,
+        )
+        return total
+
+    def user_subject_map_exists(self) -> bool:
+        """True if _user_subject_map is present in DuckDB."""
+        try:
+            return self._con.execute(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_name = '_user_subject_map'"
+            ).fetchone()[0] > 0
+        except Exception:
+            return False
+
+    def load_alloc_for_chunk(self, chunk_ids: list, chunk_type: str) -> pd.DataFrame:
+        """
+        Stage 2 of two-stage precompute.
+
+        Looks up the chunk's users in _user_subject_map (indexed scan),
+        then JOINs with lessons / lesson_types in one DuckDB query.
+        Returns a DataFrame with the same columns as fetch_allocation().
+        """
+        if not chunk_ids:
+            return pd.DataFrame()
+
+        ph = ", ".join(["?" for _ in chunk_ids])
+
+        if chunk_type == "staff":
+            path_filter = "usm.allocation_path = 'staff'"
+            lesson_access = """
+              AND (
+                  usm.user_type = 1
+                  OR (usm.user_type = 2
+                      AND (usm.is_master_trainer IS NULL OR usm.is_master_trainer != 1)
+                      AND l.facilitator_access = 1)
+                  OR (usm.user_type = 2
+                      AND usm.is_master_trainer = 1
+                      AND l.mastertrainer_access = 1)
+              )"""
+            student_filter = ""
+        else:
+            path_filter = "usm.allocation_path IN ('non_ple', 'ple')"
+            lesson_access = ""
+            student_filter = "AND l.student_access = 1"
+
+        sql = f"""
+            SELECT
+                usm.user_id,
+                usm.user_name,
+                usm.user_type,
+                usm.centre_id,
+                usm.project_id,
+                usm.batch_id,
+                usm.trade_id,
+                usm.career_path_id,
+                usm.career_path_name,
+                usm.career_path_updated_at,
+                usm.subject_id,
+                usm.subject_name,
+                usm.subject_is_ple,
+                usm.ple_career_path_id,
+                usm.year_to_map,
+                usm.subject_order,
+                l.id            AS lesson_id,
+                l.name          AS lesson_name,
+                l.lesson_order,
+                lt.name         AS lesson_type,
+                CASE WHEN l.is_assessment = 1
+                          OR upper(l.name) LIKE '%ASSESSMENT%'
+                     THEN 1 ELSE 0
+                END             AS is_assessment,
+                CASE
+                    WHEN l.student_access       = 1 THEN 'student'
+                    WHEN l.facilitator_access   = 1 THEN 'facilitator'
+                    WHEN l.mastertrainer_access = 1 THEN 'master'
+                    ELSE NULL
+                END             AS toolkit_type,
+                usm.trade_duration,
+                usm.allocation_path,
+                usm.allocation_basis
+            FROM _user_subject_map usm
+            JOIN lessons l
+                ON  l.subject_id         = usm.subject_id
+                AND l.status             = 1
+                AND l.deleted_at         IS NULL
+                AND l.lesson_category_id = 'd78bc322-568f-4110-8e24-02ea444d48b7'
+                {student_filter}
+            LEFT JOIN lesson_types lt ON lt.id = l.lesson_type_id
+            WHERE usm.user_id IN ({ph})
+              AND {path_filter}
+              {lesson_access}
+        """
+        df = self._con.execute(sql, chunk_ids).fetchdf()
+        log.debug("[table_cache] load_alloc_for_chunk → %d rows (%s)", len(df), chunk_type)
+        return df
+
     # ── Opt 1 — Precompute full allocation ────────────────────────────────────
 
     _ORDER_BY_RE = re.compile(r'\s+ORDER\s+BY\b.*', re.IGNORECASE | re.DOTALL)

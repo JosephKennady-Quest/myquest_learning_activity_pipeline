@@ -284,9 +284,13 @@ def _setup_cache(force_refresh: bool, since: Optional[str], scoped: bool):
     fetch_fn = tbl.make_fetch_fn()
     log.info("[table_cache] s1 + s2 + s3 will query DuckDB cache this run")
 
-    # Per-chunk JOINs against indexed DuckDB tables (build_indexes() above).
-    # Precomputing all 370M rows upfront took >1 hour — disabled.
-    alloc_precomputed = False
+    # Two-stage precompute: build user×subject map (~21M rows, ~5 min),
+    # then expand to lessons per-chunk (~1-2s each).
+    if not tbl.user_subject_map_exists():
+        tbl.precompute_user_subject_map(LEARNER_TYPES_SQL)
+    else:
+        log.info("[table_cache] _user_subject_map already built — reusing")
+    alloc_precomputed = tbl.user_subject_map_exists()
 
     # Opt 4 — fetch all completion in one DuckDB query
     all_completion_df = tbl.fetch_all_completion()
@@ -349,10 +353,8 @@ def _process_one_chunk(
 
     # ── Allocation ────────────────────────────────────────────────────────────
     if alloc_precomputed and tbl is not None:
-        alloc = tbl.load_alloc_precomputed_chunk(chunk_ids)
-        # Apply path filter (precomputed has all paths; slice to relevant ones)
-        alloc = alloc[alloc["allocation_path"].isin(alloc_paths)].reset_index(drop=True) if not alloc.empty else alloc
-        log.debug("[chunk %d] alloc → _alloc_precomputed (%d rows)", chunk_idx, len(alloc))
+        alloc = tbl.load_alloc_for_chunk(chunk_ids, chunk_type)
+        log.debug("[chunk %d] alloc → _user_subject_map (%d rows)", chunk_idx, len(alloc))
     elif _alloc_from_cache and cache is not None:
         try:
             alloc = cache.load_chunk(chunk_ids)

@@ -82,6 +82,80 @@ _COMMON_SELECT_STAFF = _COMMON_SELECT.replace(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Two-stage precompute support
+#
+# Stage 1: materialise _user_subject_map (user × subject, ~21M rows).
+#   Uses _SUBJECT_SELECT / _SUBJECT_JOINS so lesson columns are omitted,
+#   keeping the output ~18× smaller than the full user × lesson table.
+#
+# Stage 2 (per chunk): DuckDB JOIN of _user_subject_map with lessons for
+#   the 2 000 users in the chunk — fast indexed scan (~1–2 s per chunk).
+# ─────────────────────────────────────────────────────────────────────────────
+_SUBJECT_SELECT = """
+    s.id              AS subject_id,
+    s.name            AS subject_name,
+    s.is_ple          AS subject_is_ple,
+    s.ple_career_path_id,
+    s.year_to_map,
+    cs.`order`        AS subject_order,
+    t_trade.duration  AS trade_duration
+"""
+
+_SUBJECT_SELECT_STAFF = _SUBJECT_SELECT.replace(
+    "t_trade.duration  AS trade_duration",
+    "NULL              AS trade_duration",
+)
+
+# Subject-only JOIN (no lessons / lesson_types) — used for stage-1 precompute
+_SUBJECT_JOINS = """
+JOIN subjects s
+    ON  s.id          = cs.subject_id
+    AND s.status      = 1
+    AND s.deleted_at  IS NULL
+"""
+
+# Staff subject map SQL — no lesson access condition (applied per-chunk in stage 2)
+_STAFF_SUBJECT_SQL = """
+SELECT
+    u.id                        AS user_id,
+    u.name                      AS user_name,
+    u.type                      AS user_type,
+    u.centre_id,
+    u.project_id,
+    NULL                        AS batch_id,
+    NULL                        AS trade_id,
+    NULL                        AS career_path_id,
+    NULL                        AS career_path_name,
+    NULL                        AS career_path_updated_at,
+    u.is_master_trainer,
+    s.id                        AS subject_id,
+    s.name                      AS subject_name,
+    s.is_ple                    AS subject_is_ple,
+    s.ple_career_path_id,
+    s.year_to_map,
+    cs.`order`                  AS subject_order,
+    NULL                        AS trade_duration,
+    'staff'                     AS allocation_path,
+    'centre_subject (admin: all; facilitator: facilitator_access; master_trainer: mastertrainer_access)' AS allocation_basis
+
+FROM users u
+
+JOIN centre_subject cs
+    ON  cs.centre_id = u.centre_id
+
+JOIN subjects s
+    ON  s.id          = cs.subject_id
+    AND s.status      = 1
+    AND s.deleted_at  IS NULL
+
+WHERE u.type        IN (1, 2)
+  AND u.status      = 1
+  AND u.deleted_at  IS NULL
+  AND s.is_ple      IN (0, 1, 2)
+  {user_clause}
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Lesson JOINs for learners (student_access = 1 required)
 # ─────────────────────────────────────────────────────────────────────────────
 _LESSON_JOINS = """
