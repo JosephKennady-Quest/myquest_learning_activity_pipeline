@@ -368,11 +368,19 @@ def _concat(frames: list) -> pd.DataFrame:
         return pd.DataFrame()
     if len(frames) == 1:
         return frames[0].reset_index(drop=True)
+
+    # A column that is all-NA in ANY frame triggers pandas' concat
+    # FutureWarning.  Cast such columns to object in EVERY frame (not just
+    # the all-NA one) so dtypes match and pandas has nothing to "exclude".
+    all_na_cols = set()
+    for df in frames:
+        all_na_cols.update(c for c in df.columns if df[c].isna().all())
+
     fixed = []
     for df in frames:
         df = df.copy()
-        for col in df.columns:
-            if df[col].isna().all():
+        for col in all_na_cols:
+            if col in df.columns:
                 df[col] = df[col].astype(object)
         fixed.append(df)
     return pd.concat(fixed, ignore_index=True)
