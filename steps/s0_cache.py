@@ -382,10 +382,15 @@ class AllocationCache:
         if not user_ids:
             return pd.DataFrame()
         placeholders = ", ".join(["?" for _ in user_ids])
-        return self._con.execute(
-            f"SELECT * FROM allocation_cache WHERE user_id IN ({placeholders})",
-            user_ids,
-        ).fetchdf()
+        # Cursor per call — read concurrently by CHUNK_WORKERS threads.
+        cur = self._con.cursor()
+        try:
+            return cur.execute(
+                f"SELECT * FROM allocation_cache WHERE user_id IN ({placeholders})",
+                user_ids,
+            ).fetchdf()
+        finally:
+            cur.close()
 
     # ── Opt 10 — Auto-checkpoint ──────────────────────────────────────────────
 
@@ -1134,7 +1139,12 @@ class TableCache:
               AND {path_filter}
               {lesson_access}
         """
-        df = self._con.execute(sql, chunk_ids).fetchdf()
+        # Cursor per call — read concurrently by CHUNK_WORKERS threads.
+        cur = self._con.cursor()
+        try:
+            df = cur.execute(sql, chunk_ids).fetchdf()
+        finally:
+            cur.close()
         log.debug("[table_cache] load_alloc_for_chunk → %d rows (%s)", len(df), chunk_type)
         return df
 
@@ -1361,7 +1371,13 @@ class TableCache:
 
         def _duckdb_fetch(cfg, sql: str, params):
             adapted = sql.replace("`", '"').replace("%s", "?")
-            return con.execute(adapted, list(params) if params else []).fetchdf()
+            # One cursor per call — DuckDB connections cannot run concurrent
+            # queries, and this fetch_fn is shared by CHUNK_WORKERS threads.
+            cur = con.cursor()
+            try:
+                return cur.execute(adapted, list(params) if params else []).fetchdf()
+            finally:
+                cur.close()
 
         return _duckdb_fetch
 

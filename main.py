@@ -279,6 +279,11 @@ def _setup_cache(force_refresh: bool, since: Optional[str], scoped: bool):
     else:
         tbl.log_status()
 
+    # Allocation sources changed → previously cached allocation rows were
+    # built under old data/rules and must not be served this run.
+    if alloc_changed or force_refresh:
+        cache.reset()
+
     tbl.build_indexes()
 
     # Refresh completion tables (incremental unless --force-refresh)
