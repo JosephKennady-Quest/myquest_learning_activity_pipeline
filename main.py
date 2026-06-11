@@ -4,8 +4,11 @@ AEL V2 Pipeline — User Learning Allocation & Completion
 
 Optimisations in this version
 ──────────────────────────────
-Opt 1  — precompute_allocation(): all 3 allocation JOINs run once for all
-         users; each chunk does a fast indexed scan.  ~10 h → ~20 min.
+Opt 1  — HYBRID allocation: per-chunk allocation JOINs run against
+         production MySQL (B-tree indexed IN-list lookups — fast and
+         reliable), while completion + user data come from the DuckDB
+         cache.  DuckDB precompute removed: DuckDB hash-joins entire
+         tables per query, which made full precompute hang for hours.
 
 Opt 2  — Parallel chunk processing via ThreadPoolExecutor (CHUNK_WORKERS).
          Each worker fetches allocation + runs merge_completion independently.
@@ -57,7 +60,7 @@ import pandas as pd
 
 from config import (
     ANALYTICS_DB, ALLOC_CHUNK_SIZE, CHUNK_WORKERS,
-    LEARNER_TYPES_SQL, OUTPUT_DIR, STAFF_ALLOC_CHUNK_SIZE,
+    OUTPUT_DIR, STAFF_ALLOC_CHUNK_SIZE,
 )
 from db import TunnelPool, delete_user_rows, write_table
 from steps.s0_cache import AllocationCache, ResultBuffer, TableCache
@@ -282,15 +285,16 @@ def _setup_cache(force_refresh: bool, since: Optional[str], scoped: bool):
     tbl.refresh_completion_tables(incremental=not force_refresh)
 
     fetch_fn = tbl.make_fetch_fn()
-    log.info("[table_cache] s1 + s2 + s3 will query DuckDB cache this run")
+    log.info(
+        "[table_cache] Hybrid mode: s1 + s3 query DuckDB cache; "
+        "s2 allocation queries production MySQL (indexed per-chunk lookups)"
+    )
 
-    # Two-stage precompute: build user×subject map (~21M rows, ~5 min),
-    # then expand to lessons per-chunk (~1-2s each).
-    if not tbl.user_subject_map_exists():
-        tbl.precompute_user_subject_map(LEARNER_TYPES_SQL)
-    else:
-        log.info("[table_cache] _user_subject_map already built — reusing")
-    alloc_precomputed = tbl.user_subject_map_exists()
+    # Hybrid: no DuckDB precompute. Allocation JOINs run per-chunk against
+    # production MySQL, whose B-tree indexes make IN-list chunk queries fast.
+    # DuckDB hash-joins entire tables per query regardless of indexes, which
+    # made both the per-chunk path slow and the precompute hang for hours.
+    alloc_precomputed = False
 
     # Opt 4 — fetch all completion in one DuckDB query
     all_completion_df = tbl.fetch_all_completion()
@@ -366,10 +370,13 @@ def _process_one_chunk(
                 subject_id=subject_id, trade_id=trade_id, paths=alloc_paths,
             )
     else:
+        # Hybrid: fetch_fn=None → allocation queries go to production MySQL
+        # over the pooled SSH tunnel (index-driven IN-list lookups).
+        # Completion still comes from the DuckDB cache (all_completion_df).
         alloc = fetch_allocation(
             user_ids=chunk_ids, centre_id=centre_id, batch_id=batch_id,
             subject_id=subject_id, trade_id=trade_id, paths=alloc_paths,
-            fetch_fn=fetch_fn,
+            fetch_fn=None,
         )
         if cache is not None and not alloc.empty:
             with _cache_total_rows_lock:
