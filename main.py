@@ -284,13 +284,9 @@ def _setup_cache(force_refresh: bool, since: Optional[str], scoped: bool):
     fetch_fn = tbl.make_fetch_fn()
     log.info("[table_cache] s1 + s2 + s3 will query DuckDB cache this run")
 
-    # Opt 1 — precompute full allocation once for all users
+    # Per-chunk JOINs against indexed DuckDB tables (build_indexes() above).
+    # Precomputing all 370M rows upfront took >1 hour — disabled.
     alloc_precomputed = False
-    if not tbl.alloc_precomputed_exists():
-        tbl.precompute_allocation(LEARNER_TYPES_SQL)
-    else:
-        log.info("[table_cache] _alloc_precomputed already built — reusing")
-    alloc_precomputed = tbl.alloc_precomputed_exists()
 
     # Opt 4 — fetch all completion in one DuckDB query
     all_completion_df = tbl.fetch_all_completion()
