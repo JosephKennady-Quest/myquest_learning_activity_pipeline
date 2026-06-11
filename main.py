@@ -22,13 +22,17 @@ Opt 4  — Batch completion: fetch ALL users' completion from DuckDB in one
          query instead of per-chunk.  Completion is then sliced per chunk
          from an in-memory dict — zero SSH cost for completion.
 
-Opt 5  — ResultBuffer: all chunk results buffered in DuckDB, flushed once
-         at the end using a single persistent connection.
+Opt 5  — Direct per-chunk writes: each chunk is written to the analytics DB
+         as it finishes (over the persistent TunnelPool connection) so a
+         crash leaves committed rows and the run is resumable.  (The old
+         end-of-run ResultBuffer lost every chunk on a mid-run crash.)
 
 Opt 7  — run() split into named stages: setup_cache, build_chunks,
          process_chunks, flush_outputs, finalise.
 
-Opt 10 — Auto-checkpoint: last written chunk saved to cache_meta.  A killed
+Opt 10 — Auto-checkpoint: highest CONTIGUOUS written chunk saved to
+         cache_meta after each write (gap-safe under parallel workers).
+         A killed
          run auto-resumes from the checkpoint without --start-chunk.
 
 Usage:
@@ -451,7 +455,7 @@ def _process_chunks(
     """
     Stage 3 — process all chunks (parallel when workers > 1).
 
-    Returns (summary_rows, no_alloc_rows, first_write, first_all_write).
+    Returns (summary_rows, no_alloc_rows, cache_total_rows).
     """
     _alloc_from_cache  = (
         cache is not None and not alloc_precomputed and cache.is_ready()
@@ -467,12 +471,24 @@ def _process_chunks(
 
     summary_rows       = []
     no_alloc_rows      = []
-    first_write        = (start_chunk == 1)
-    first_all_write    = (start_chunk == 1)
+    # Per-table "replace once" flags — exactly one chunk replaces each table
+    # to start a fresh full run; every other chunk appends.  On resume
+    # (start_chunk > 1) all flags are False so prior rows are preserved.
+    first_lesson_write  = (start_chunk == 1)
+    first_subject_write = (start_chunk == 1)
+    first_all_write     = (start_chunk == 1)
+
+    # Crash-safe checkpoint: persist the highest CONTIGUOUS completed chunk.
+    # With parallel workers chunks finish out of order, so a plain "last
+    # written" value could skip gaps on resume.  We advance the saved prefix
+    # only while every chunk up to it is done.  Chunks 1..start_chunk-1 were
+    # committed by a previous run, so they seed the completed set.
+    _completed_chunks  = set(range(1, start_chunk))
+    _ckpt_prefix       = [start_chunk - 1]
 
     def _write_chunk_result(chunk_idx, result, subj_all_df, alloc_raw, alloc_filt, no_alloc_ids):
         """Write one processed chunk's outputs. Called inside the worker."""
-        nonlocal first_write, first_all_write
+        nonlocal first_lesson_write, first_subject_write, first_all_write
 
         if result.empty:
             return
@@ -494,18 +510,13 @@ def _process_chunks(
 
         subject_agg_df = _build_subject_agg(result)
 
-        if output in ("db", "both"):
-            if since:
-                chunk_ids_list = result["user_id"].dropna().unique().tolist()
-                delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_LESSON,  chunk_ids_list)
-                delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_SUBJECT, chunk_ids_list)
-                if all_lesson_types:
-                    delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_SUBJECT_ALL, chunk_ids_list)
-                db_mode     = "append"
-                db_mode_all = "append"
-            else:
-                db_mode     = "replace" if first_write     else "append"
-                db_mode_all = "replace" if first_all_write else "append"
+        # Resume of a full run may reprocess tail chunks that the crashed run
+        # already committed (workers finish out of order).  Delete this chunk's
+        # users before appending so a re-append cannot duplicate rows.  The
+        # --since path always deletes-then-appends for the same reason.
+        resume_dedup = (start_chunk > 1) and not since
+        chunk_uids   = (result["user_id"].dropna().unique().tolist()
+                        if (since or resume_dedup) else None)
 
         if "lesson" in active:
             if output in ("csv", "both"):
@@ -513,14 +524,13 @@ def _process_chunks(
                           subject_id_filter, trade_id_filter, prefix="lessons_filtered")
             if output in ("db", "both"):
                 with _buf_lock:
-                    if result_buf:
-                        result_buf.append("lesson", result)
-                        log.info("[result_buf] Chunk %d buffered → lesson (%d rows, total: %d)",
-                                 chunk_idx, len(result), result_buf.row_count("lesson"))
-                    else:
-                        write_table(ANALYTICS_DB, result, OUTPUT_TABLE_LESSON, if_exists=db_mode)
-                        log.info("DB written → %s (chunk %d/%d, mode=%s)",
-                                 OUTPUT_TABLE_LESSON, chunk_idx, n_chunks, db_mode)
+                    if since or resume_dedup:
+                        delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_LESSON, chunk_uids)
+                    mode = "replace" if first_lesson_write else "append"
+                    first_lesson_write = False
+                    write_table(ANALYTICS_DB, result, OUTPUT_TABLE_LESSON, if_exists=mode)
+                    log.info("DB written → %s (chunk %d/%d, mode=%s)",
+                             OUTPUT_TABLE_LESSON, chunk_idx, n_chunks, mode)
 
         if "subject" in active:
             if output in ("csv", "both"):
@@ -528,31 +538,30 @@ def _process_chunks(
                           subject_id_filter, trade_id_filter, prefix="subjects_filtered")
             if output in ("db", "both"):
                 with _buf_lock:
-                    if result_buf:
-                        result_buf.append("subject", subject_agg_df)
-                        log.info("[result_buf] Chunk %d buffered → subject (%d rows, total: %d)",
-                                 chunk_idx, len(subject_agg_df), result_buf.row_count("subject"))
-                    else:
-                        write_table(ANALYTICS_DB, subject_agg_df, OUTPUT_TABLE_SUBJECT,
-                                    if_exists=db_mode)
-                        log.info("DB written → %s (chunk %d/%d, mode=%s)",
-                                 OUTPUT_TABLE_SUBJECT, chunk_idx, n_chunks, db_mode)
+                    if since or resume_dedup:
+                        delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_SUBJECT, chunk_uids)
+                    mode = "replace" if first_subject_write else "append"
+                    first_subject_write = False
+                    write_table(ANALYTICS_DB, subject_agg_df, OUTPUT_TABLE_SUBJECT, if_exists=mode)
+                    log.info("DB written → %s (chunk %d/%d, mode=%s)",
+                             OUTPUT_TABLE_SUBJECT, chunk_idx, n_chunks, mode)
 
             if all_lesson_types and output in ("db", "both") and not subj_all_df.empty:
                 with _buf_lock:
-                    if result_buf:
-                        result_buf.append("subject_all", subj_all_df)
-                    else:
-                        write_table(ANALYTICS_DB, subj_all_df, OUTPUT_TABLE_SUBJECT_ALL,
-                                    if_exists=db_mode_all)
+                    if since or resume_dedup:
+                        delete_user_rows(ANALYTICS_DB, OUTPUT_TABLE_SUBJECT_ALL, chunk_uids)
+                    mode = "replace" if first_all_write else "append"
+                    first_all_write = False
+                    write_table(ANALYTICS_DB, subj_all_df, OUTPUT_TABLE_SUBJECT_ALL, if_exists=mode)
 
-        # Opt 10 — save checkpoint after successful write
+        # Crash-safe checkpoint: persist the highest CONTIGUOUS completed chunk
+        # so a resume never skips a gap left by out-of-order parallel workers.
         if cache is not None and not dry_run:
             with _cache_lock:
-                cache.save_checkpoint(chunk_idx)
-
-        first_write     = False
-        first_all_write = False
+                _completed_chunks.add(chunk_idx)
+                while (_ckpt_prefix[0] + 1) in _completed_chunks:
+                    _ckpt_prefix[0] += 1
+                cache.save_checkpoint(_ckpt_prefix[0])
 
     # ── Sequential path (workers=1) ───────────────────────────────────────────
     if workers <= 1:
@@ -638,11 +647,17 @@ def _flush_outputs(result_buf, active, all_lesson_types, dry_run):
     log.info("[result_buf] ── Flush complete ────────────────────────────────────")
 
 
-def _finalise(cache, tbl, alloc_precomputed, cache_total_rows):
-    """Stage 5 — persist snapshot, clean up temp tables, close cache."""
+def _finalise(cache, tbl, alloc_precomputed, cache_total_rows, fresh_run=True):
+    """Stage 5 — persist snapshot, clean up temp tables, close cache.
+
+    fresh_run: only a complete run started at chunk 1 may mark the
+    allocation_cache as ready.  A resumed run only rebuilt the tail
+    chunks, so marking it ready would let a later run reuse an
+    incomplete cache.
+    """
     if cache is None:
         return
-    if not alloc_precomputed and cache_total_rows > 0:
+    if fresh_run and not alloc_precomputed and cache_total_rows > 0:
         cache.finalise(cache_total_rows)
         cache.save_snapshot()
         log.info("[cache] Allocation cache rebuilt — %d rows", cache_total_rows)
@@ -753,16 +768,18 @@ def run(
         if start_chunk > 1:
             log.info("Resuming — chunks 1..%d already written; appending only.", start_chunk - 1)
 
+        # A fresh build that isn't reusing a ready cache starts from an empty
+        # allocation_cache, so partial rows left by a previous crashed build
+        # can't accumulate into duplicates.
+        if start_chunk == 1 and cache is not None and not cache.is_ready():
+            cache.reset()
+
         # ── Result buffer ────────────────────────────────────────────────────
-        _use_result_buf = (
-            cache is not None
-            and not since
-            and start_chunk == 1
-            and output in ("db", "both")
-        )
-        result_buf = ResultBuffer(cache._con) if _use_result_buf else None
-        if _use_result_buf:
-            log.info("[result_buf] Result buffering ON — analytics DB writes deferred to end of run")
+        # Disabled: results are written to the analytics DB per chunk so a
+        # crash leaves committed rows and the checkpoint can resume cleanly.
+        # Buffering deferred ALL writes to the end, which lost every chunk on
+        # a mid-run crash.  (ResultBuffer kept for --since/manual use only.)
+        result_buf = None
 
         # ── Stage 3: process chunks ──────────────────────────────────────────
         summary_rows, no_alloc_rows, cache_total_rows = _process_chunks(
@@ -809,7 +826,7 @@ def run(
             log.info("No-allocation users saved → %s (%d users)", path, len(no_alloc_df))
 
         # ── Stage 5: finalise ────────────────────────────────────────────────
-        _finalise(cache, tbl, alloc_precomputed, cache_total_rows)
+        _finalise(cache, tbl, alloc_precomputed, cache_total_rows, fresh_run=(start_chunk == 1))
 
         # ── Final summary ─────────────────────────────────────────────────────
         if summary_rows:
