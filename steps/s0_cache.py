@@ -943,28 +943,38 @@ class TableCache:
         log.info("[table_cache] ── Building user×subject map (stage-1 precompute) ──────")
         t0 = time.time()
 
+        # Live progress bar in the terminal for each long-running CREATE TABLE,
+        # so a slow build is visibly progressing rather than looking stuck.
+        try:
+            self._con.execute("SET enable_progress_bar = true")
+        except Exception:
+            pass
+
         def _build_learner(template, path_name, basis):
-            extra = f"\n    NULL                        AS is_master_trainer,"
+            # Build the inner SQL using _SUBJECT_SELECT directly — no string
+            # literal injection inside the inner query.  allocation_path and
+            # allocation_basis are added by the outer CREATE TABLE wrapper,
+            # avoiding the DuckDB parser error caused by injecting 'non_ple'
+            # inside a nested SELECT via f-string concatenation.
+            extra = "\n    NULL                        AS is_master_trainer,"
             sql = template.format(
-                common_select=extra + _SUBJECT_SELECT
-                    + f"\n    '{path_name}'               AS allocation_path,"
-                    + f"\n    '{basis}'                   AS allocation_basis",
+                common_select=extra + _SUBJECT_SELECT,
                 lesson_joins=_SUBJECT_JOINS,
                 types=learner_types_sql,
                 user_clause="",
             )
             sql = self._adapt_sql_for_duckdb(sql)
-            return self._strip_trailing_order_by(sql)
+            return self._strip_trailing_order_by(sql), path_name, basis
 
-        non_ple_sql = _build_learner(
+        non_ple_sql, non_ple_path, non_ple_basis = _build_learner(
             _NON_PLE_SQL, "non_ple",
             "centre_subject [-> batch_subject if batch] [-> subject_trade if trade]",
         )
-        ple_sql = _build_learner(
+        ple_sql, ple_path, ple_basis = _build_learner(
             _PLE_SQL, "ple",
             "centre_subject [-> subject_ple_career_path if career_path] [-> batch_subject if batch]",
         )
-        staff_sql = self._adapt_sql_for_duckdb(
+        raw_staff_sql = self._adapt_sql_for_duckdb(
             self._strip_trailing_order_by(
                 _STAFF_SUBJECT_SQL.format(user_clause="")
             )
@@ -974,22 +984,45 @@ class TableCache:
             self._con.execute(f"DROP TABLE IF EXISTS {tbl}")
 
         path_specs = [
-            ("_usm_non_ple", non_ple_sql, "non_ple"),
-            ("_usm_ple",     ple_sql,     "ple"),
-            ("_usm_staff",   staff_sql,   "staff"),
+            ("_usm_non_ple", non_ple_sql, non_ple_path, non_ple_basis),
+            ("_usm_ple",     ple_sql,     ple_path,     ple_basis),
+            # staff SQL already contains allocation_path/allocation_basis literals
+            # (they're baked into _STAFF_SUBJECT_SQL), so we pass empty strings
+            # and skip the outer injection for staff.
+            ("_usm_staff",   raw_staff_sql, None,        None),
         ]
-        for tbl, sql, path in path_specs:
-            log.info("[table_cache]   %s: building subject map ...", path)
+        for tbl, sql, path_name, basis in path_specs:
+            log.info("[table_cache]   %s: building subject map ...", path_name or "staff")
             t1 = time.time()
-            self._con.execute(
-                "CREATE TABLE " + tbl + " AS "
-                "SELECT * EXCLUDE (career_path_updated_at), "
-                "       TRY_CAST(career_path_updated_at AS TIMESTAMP) AS career_path_updated_at, "
-                "       TRY_CAST(is_master_trainer AS INTEGER)        AS is_master_trainer "
-                "FROM (" + sql + ") _q"
-            )
+            if path_name is not None:
+                # Pass allocation_path and allocation_basis as ? parameters so
+                # the string literals are never embedded inside the SQL string.
+                # This is what caused the original DuckDB ParserException:
+                #   syntax error at or near "'non_ple'"
+                # — the literal was injected raw inside a nested SELECT via
+                # f-string, which DuckDB couldn't parse in that context.
+                wrapper = (
+                    f"CREATE TABLE {tbl} AS "
+                    f"SELECT * EXCLUDE (career_path_updated_at), "
+                    f"       TRY_CAST(career_path_updated_at AS TIMESTAMP) AS career_path_updated_at, "
+                    f"       TRY_CAST(is_master_trainer AS INTEGER)        AS is_master_trainer, "
+                    f"       ? AS allocation_path, "
+                    f"       ? AS allocation_basis "
+                    f"FROM ({sql}) _q"
+                )
+                self._con.execute(wrapper, [path_name, basis])
+            else:
+                # staff SQL already carries allocation_path/allocation_basis
+                wrapper = (
+                    f"CREATE TABLE {tbl} AS "
+                    f"SELECT * EXCLUDE (career_path_updated_at), "
+                    f"       TRY_CAST(career_path_updated_at AS TIMESTAMP) AS career_path_updated_at, "
+                    f"       TRY_CAST(is_master_trainer AS INTEGER)        AS is_master_trainer "
+                    f"FROM ({sql}) _q"
+                )
+                self._con.execute(wrapper)
             cnt = self._con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
-            log.info("[table_cache]   %s: %d rows  (%.0fs)", path, cnt, time.time() - t1)
+            log.info("[table_cache]   %s: %d rows  (%.0fs)", path_name or "staff", cnt, time.time() - t1)
 
         log.info("[table_cache]   combining paths → _user_subject_map ...")
         self._con.execute("""
