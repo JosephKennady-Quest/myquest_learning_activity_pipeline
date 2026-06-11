@@ -10,8 +10,9 @@ Three allocation paths, merged in fetch_allocation():
     Lessons: student_access = 1
 
   PLE learners (type 3/4, is_ple = 1):
+    MUST have an active career path — users without one get NULL allocation (no rows).
     centre_subject              — always applied (base)
-    ∩ subject_ple_career_path   — only if user has an active career path
+    ∩ subject_ple_career_path   — required (active career path mandatory)
     ∩ batch_subject             — only if user has a batch_id
     Lessons: student_access = 1
 
@@ -227,7 +228,8 @@ WHERE u.type        IN ({types})
   AND u.deleted_at  IS NULL
   AND u.is_ple      = 1
   AND s.is_ple      IN (1, 2)
-  AND (pcp.id       IS NULL OR spcp.subject_id IS NOT NULL)
+  AND pcp.id        IS NOT NULL
+  AND spcp.subject_id IS NOT NULL
   AND (sd.batch_id  IS NULL OR bs.subject_id   IS NOT NULL)
   AND (s.year_to_map IS NULL OR s.year_to_map = 0 OR t_trade.duration IS NULL OR s.year_to_map <= t_trade.duration)
   {user_clause}
@@ -402,9 +404,8 @@ def fetch_ple_allocation(
 ) -> pd.DataFrame:
     """
     Subjects allocated to PLE learners (types 3, 4, is_ple = 1).
-    centre_subject is always the base; subject_ple_career_path and
-    batch_subject intersections are applied only when the user has an
-    active career path / batch_id respectively.
+    An active career path is REQUIRED — users without one return 0 rows
+    (they appear as NULL-allocation stubs in the final output).
     When a career path exists, only the most recently updated active one
     is used (enforced via ROW_NUMBER() in the SQL).
     """
