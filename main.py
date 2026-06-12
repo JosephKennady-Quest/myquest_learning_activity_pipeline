@@ -277,7 +277,8 @@ def _setup_cache(force_refresh: bool, since: Optional[str], scoped: bool):
 
     alloc_changed = cache.allocation_changed()
 
-    if alloc_changed or not tbl.is_fresh() or force_refresh:
+    did_refresh = alloc_changed or not tbl.is_fresh() or force_refresh
+    if did_refresh:
         log.info("[table_cache] Refreshing source tables from production ...")
         tbl.refresh()
     else:
@@ -287,6 +288,13 @@ def _setup_cache(force_refresh: bool, since: Optional[str], scoped: bool):
     # built under old data/rules and must not be served this run.
     if alloc_changed or force_refresh:
         cache.reset()
+
+    # Record the source-table state now that the cache reflects it.  Without
+    # this the hash snapshot was only saved on a fully completed run, so every
+    # killed-and-resumed run re-downloaded all source tables (~13 min wasted).
+    # Saving here lets a resume see "unchanged" and skip the re-download.
+    if did_refresh:
+        cache.save_snapshot()
 
     tbl.build_indexes()
 
