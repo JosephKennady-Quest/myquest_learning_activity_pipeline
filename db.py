@@ -25,9 +25,29 @@ import pandas as pd
 import paramiko
 import pymysql
 
-from config import CHUNK_SIZE
+from config import CHUNK_SIZE, DB_DIRECT
 
 log = logging.getLogger(__name__)
+
+
+def _direct_connect(cfg: Dict[str, Any]) -> "pymysql.connections.Connection":
+    """
+    Connect pymysql straight to the RDS endpoint, no SSH tunnel.
+
+    Used when DB_DIRECT is set (host has direct network access to RDS).
+    The RDS host/port live in cfg['ssh']['remote_bind_address'/'remote_bind_port'].
+    Each call returns an independent connection, so worker threads run fully
+    in parallel with no shared transport.
+    """
+    return pymysql.connect(
+        host=cfg["ssh"]["remote_bind_address"],
+        port=int(cfg["ssh"]["remote_bind_port"]),
+        user=cfg["db"]["user"],
+        password=cfg["db"]["password"],
+        database=cfg["db"]["database"],
+        charset="utf8mb4",
+        connect_timeout=30,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -204,7 +224,14 @@ class TunnelPool:
         """
         Open a persistent SSH tunnel for cfg and keep it alive.
         Safe to call multiple times for the same cfg (idempotent).
+        No-op in DB_DIRECT mode (connections bypass the tunnel).
         """
+        if DB_DIRECT:
+            log.info(
+                "[TunnelPool] DB_DIRECT mode — connecting straight to %s:%s (no SSH tunnel)",
+                cfg["ssh"]["remote_bind_address"], cfg["ssh"]["remote_bind_port"],
+            )
+            return
         key = _cfg_key(cfg)
         if key in self._tunnels:
             return
@@ -349,6 +376,14 @@ def _connect_or_pool(cfg: Dict[str, Any]):
     Yields a pymysql connection.  Caller must NOT close pooled connections — the
     context manager handles it.
     """
+    if DB_DIRECT:
+        conn = _direct_connect(cfg)
+        try:
+            yield conn
+        finally:
+            conn.close()
+        return
+
     pool = TunnelPool._active
     if pool is not None:
         conn = pool.get_conn(cfg)

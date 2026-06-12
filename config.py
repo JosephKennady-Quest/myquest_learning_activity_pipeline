@@ -67,6 +67,15 @@ OUTPUT_DIR        = os.getenv("OUTPUT_DIR", "output")
 # Set to 1 to disable parallelism (equivalent to the original sequential loop).
 CHUNK_WORKERS = int(os.getenv("CHUNK_WORKERS", "4"))
 
+# ── Direct DB connection (no SSH tunnel) ──────────────────────────────────────
+# On a host with direct network access to the RDS endpoints (e.g. the server
+# inside the VPC), set DB_DIRECT=1 to connect pymysql straight to
+# SOURCE_RDS_HOST / DEST_RDS_HOST and skip the SSH tunnel entirely.  This is
+# faster (no SSH forwarding overhead) and naturally parallel — each worker gets
+# its own independent MySQL connection instead of sharing one SSH transport.
+# Leave unset (default) on a laptop that must reach RDS through the bastion.
+DB_DIRECT = os.getenv("DB_DIRECT", "false").strip().lower() in ("1", "true", "yes", "on")
+
 # ── DuckDB memory cap ─────────────────────────────────────────────────────────
 # By default DuckDB sizes its buffer pool at ~80% of system RAM. During a full
 # run it holds the source + completion tables AND a growing allocation_cache,
