@@ -141,7 +141,25 @@ class AllocationCache:
     def __init__(self, path: str = DEFAULT_CACHE_PATH):
         self.path = path
         self._con = duckdb.connect(path)
+        self._apply_memory_limit()
         self._init_schema()
+
+    def _apply_memory_limit(self):
+        """
+        Cap DuckDB's buffer pool so it spills to disk instead of consuming
+        ~80% of RAM (its default), which left no headroom for the in-memory
+        completion DataFrame + parallel workers and led to OOM kills.
+        """
+        try:
+            from config import DUCKDB_MEMORY_LIMIT
+            self._con.execute(f"PRAGMA memory_limit='{DUCKDB_MEMORY_LIMIT}'")
+            # temp_directory enables on-disk spilling of large intermediates.
+            tmp = os.path.join(os.path.dirname(self.path) or ".", "duckdb_tmp")
+            self._con.execute(f"PRAGMA temp_directory='{tmp}'")
+            log.info("[cache] DuckDB memory_limit=%s, temp_directory=%s",
+                     DUCKDB_MEMORY_LIMIT, tmp)
+        except Exception as exc:
+            log.warning("[cache] Could not set DuckDB memory limit: %s", exc)
 
     def _init_schema(self):
         self._con.execute("""

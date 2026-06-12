@@ -67,6 +67,14 @@ OUTPUT_DIR        = os.getenv("OUTPUT_DIR", "output")
 # Set to 1 to disable parallelism (equivalent to the original sequential loop).
 CHUNK_WORKERS = int(os.getenv("CHUNK_WORKERS", "4"))
 
+# ── DuckDB memory cap ─────────────────────────────────────────────────────────
+# By default DuckDB sizes its buffer pool at ~80% of system RAM. During a full
+# run it holds the source + completion tables AND a growing allocation_cache,
+# which leaves no headroom for the in-memory completion DataFrame and the
+# parallel workers' per-chunk frames — causing the OS to OOM-kill the process.
+# Cap it so DuckDB spills to disk instead of competing with pandas for RAM.
+DUCKDB_MEMORY_LIMIT = os.getenv("DUCKDB_MEMORY_LIMIT", "10GB")
+
 # ── Cache invalidation ────────────────────────────────────────────────────────
 # Strategy used to detect whether allocation source tables changed.
 #   "hash"      — CRC32 of sorted (id, updated_at) values; more precise,
