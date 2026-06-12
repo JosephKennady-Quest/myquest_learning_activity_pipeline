@@ -764,6 +764,20 @@ class TableCache:
             table, removed, before, after,
         )
 
+    def _drop_completion_index(self, table: str):
+        idx_name = f"idx_{table}_user_id"
+        try:
+            self._con.execute(f"DROP INDEX IF EXISTS {idx_name}")
+        except Exception as exc:
+            log.warning("[table_cache] Could not drop index %s before upsert: %s", idx_name, exc)
+
+    def _create_completion_index(self, table: str):
+        idx_name = f"idx_{table}_user_id"
+        try:
+            self._con.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table}(user_id)")
+        except Exception as exc:
+            log.warning("[table_cache] Could not recreate index %s after upsert: %s", idx_name, exc)
+
     # ── Public refresh ────────────────────────────────────────────────────────
 
     def refresh_completion_tables(self, batch_size: int = 2000, incremental: bool = True):
@@ -812,18 +826,29 @@ class TableCache:
                             col_w, table, before_dedup - len(df),
                         )
 
-                    self._con.register("_incr_pairs", df[["user_id", "lesson_id"]])
-                    self._con.execute(f"""
-                        DELETE FROM {table}
-                        WHERE (user_id, lesson_id) IN (
-                            SELECT user_id, lesson_id FROM _incr_pairs
-                        )
-                    """)
-                    self._con.unregister("_incr_pairs")
+                    # DuckDB can fail internally while maintaining ART indexes
+                    # during DELETE.  The completion index is only an
+                    # accelerator, so rebuild it around the upsert.
+                    self._drop_completion_index(table)
+                    try:
+                        self._con.register("_incr_pairs", df[["user_id", "lesson_id"]])
+                        try:
+                            self._con.execute(f"""
+                                DELETE FROM {table}
+                                WHERE (user_id, lesson_id) IN (
+                                    SELECT user_id, lesson_id FROM _incr_pairs
+                                )
+                            """)
+                        finally:
+                            self._con.unregister("_incr_pairs")
 
-                    self._con.register("_incr", df)
-                    self._con.execute(f"INSERT INTO {table} SELECT * FROM _incr")
-                    self._con.unregister("_incr")
+                        self._con.register("_incr", df)
+                        try:
+                            self._con.execute(f"INSERT INTO {table} SELECT * FROM _incr")
+                        finally:
+                            self._con.unregister("_incr")
+                    finally:
+                        self._create_completion_index(table)
 
                     new_ts = str(df["completed_at"].max())
                     self._save_last_completion_ts(table, new_ts)
