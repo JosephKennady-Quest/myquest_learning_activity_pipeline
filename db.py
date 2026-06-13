@@ -411,10 +411,7 @@ def fetch(cfg: Dict[str, Any], sql: str, params: Optional[Tuple] = None) -> pd.D
     """
     with _connect_or_pool(cfg) as conn:
         with conn.cursor() as cur:
-            if params is None:
-                cur.execute(sql)
-            else:
-                cur.execute(sql, params)
+            cur.execute(sql, params or ())
             columns = [d[0] for d in cur.description]
             rows    = cur.fetchall()
     df = pd.DataFrame(rows, columns=columns)

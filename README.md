@@ -1,275 +1,1442 @@
-# SQL AEL MyQuest Pipeline
+# AEL V2 Pipeline — User Learning Allocation & Completion
 
-This repository contains a MySQL-based AEL/MyQuest reporting pipeline. The current runner executes the one-record-per-user production SQL once for each centre ID and appends all centre outputs into one destination table.
+A Python data pipeline that tracks **user-level learning activity allocation and completion** for QuestAlliance's AEL (Accelerated Education and Learning) programme. This is the V2 rewrite of the original Talend/Java ETL pipeline.
 
-The pipeline is designed for cases where the centre list is selected separately, for example:
+---
 
-```sql
-SELECT c.id
-FROM centres c
-LIMIT 10;
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Project Structure](#project-structure)
+- [Pipeline Steps](#pipeline-steps)
+  - [Step 1 — User Fetch](#step-1--user-fetch-s1_userspy)
+  - [Step 2 — Toolkit Allocation](#step-2--toolkit-allocation-s2_allocationpy)
+  - [Step 3 — Completion & Merge](#step-3--completion--merge-s3_completionpy)
+  - [Step 4 — User Project/Phase JSON](#step-4--user-projectphase-json-s4_users_project_phase_jsonpy)
+- [Allocation Logic](#allocation-logic)
+  - [Non-PLE Path](#non-ple-path)
+  - [PLE Path](#ple-path)
+  - [Staff Path](#staff-path)
+  - [Optional Batch / Trade Intersection](#optional-batch--trade-intersection)
+  - [Year-to-Map Filtering](#year-to-map-filtering)
+  - [Subject Platform Filter](#subject-platform-filter-subjectsis_ple)
+  - [Data Quality Rules](#data-quality-rules)
+- [Completion Logic](#completion-logic)
+  - [Source Table Routing](#source-table-routing)
+  - [Completed = 1 Filter](#completed--1-filter)
+- [Output Schema](#output-schema)
+- [Running the Pipeline](#running-the-pipeline)
+  - [All Users — Full Refresh](#all-users--full-refresh)
+  - [Single User](#single-user)
+  - [Filter Options](#filter-options)
+  - [Output Options](#output-options)
+  - [Controlling Which Outputs Are Written](#controlling-which-outputs-are-written)
+  - [All Lesson Types](#all-lesson-types)
+  - [Dry Run](#dry-run)
+- [Incremental Runs](#incremental-runs)
+- [Large Runs and Chunked Processing](#large-runs-and-chunked-processing)
+- [Local DuckDB Cache](#local-duckdb-cache)
+  - [How It Works](#how-it-works)
+  - [Two-Layer Cache Strategy](#two-layer-cache-strategy)
+  - [Source Table Cache](#source-table-cache-layer-1)
+  - [Completion Table Cache](#completion-table-cache-incremental)
+  - [Allocation Result Cache](#allocation-result-cache-layer-2)
+  - [Allocation Change Detection](#allocation-change-detection)
+  - [Cache Log Output](#cache-log-output)
+  - [Cache Commands](#cache-commands)
+- [Database Reference](#database-reference)
+- [Understanding toolkit_type](#understanding-toolkit_type)
+- [SSH Tunnel Architecture](#ssh-tunnel-architecture)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Overview
+
+This pipeline answers the question:
+
+> **For every active user — what toolkit content (subjects + lessons) are they allocated, and of that allocated content, how much have they completed?**
+
+It handles **four user types** across **three allocation paths**:
+
+| User type | Description | Allocation path | Lesson access |
+|---|---|---|---|
+| **3** | Learner | `non_ple` or `ple` | `student_access = 1` |
+| **4** | Alumni | `non_ple` or `ple` | `student_access = 1` |
+| **1** | Admin | `staff` | All lessons in centre |
+| **2** | Facilitator / Master Trainer | `staff` | `facilitator_access = 1` or `mastertrainer_access = 1` |
+
+All four paths are merged into a single output with an `allocation_path` column (`non_ple`, `ple`, `staff`) for traceability.
+
+---
+
+## Architecture
+
+```
+quest_rearch_production (source DB — read only)
+        │
+        │  ◄── SSH tunnel (paramiko) ──────────────────────────────────────────
+        │
+        ├── users + student_details            ┐ cached in DuckDB at startup
+        ├── centre_subject                     │ (refreshed when allocation
+        ├── batch_subject                      │  tables change)
+        ├── subject_trade                      │
+        ├── subject_ple_career_path            │
+        ├── ple_career_path_user               │
+        ├── ple_career_paths                   │
+        ├── subjects + lessons + lesson_types  │
+        └── trades                             ┘
+        │
+        ├── learning_activities                ┐ cached in DuckDB every run
+        └── facilitator_learning_activities    ┘ (incremental: only new
+                                                  completed_at > last run)
+
+        cache.duckdb  (local file — gitignored)
+        │
+        ├── Layer 1 — source tables (users, subjects, lessons, …)
+        │            s1 + s2 queries run locally, no SSH per chunk
+        │
+        ├── Layer 1b — completion tables (learning_activities, …)
+        │             s3 queries run locally, no SSH per chunk
+        │
+        └── Layer 2 — allocation result cache
+                      per-chunk allocation loaded directly from DuckDB
+                      (skips even the local JOIN queries when unchanged)
+
+                        ↓
+              Step 1: fetch users          → DuckDB (Layer 1)
+              Step 2: fetch allocation     → DuckDB (Layer 1 or Layer 2)
+              Step 3: fetch completion     → DuckDB (Layer 1b)
+                        ↓
+              pandas merge (LEFT JOIN allocation × completion)
+                        ↓
+              filter: completed = 1 only
+                        ↓
+              ┌─────────────────────┐
+              │  Final Output       │
+              │  (DB tables / CSV)  │
+              └─────────────────────┘
+
+quest_analytics (analytics DB — write only)
+        ├── main_learning_activity_myquest_ael                ← subject-level, filtered         ┐ Steps 1–3
+        ├── main_learning_activity_myquest_ael_all_lesson_type ← subject-level, all types       │
+        ├── main_learning_activity_myquest_ael_lesson         ← lesson-level, filtered          ┘
+        │
+        └── main_wcc_json                                     ← one row per user (Step 4)
+                ├── project_phase_combos  JSON  ← from main_centre_project + main_phases
+                └── subject_combos        JSON  ← from main_learning_activity_myquest_ael
 ```
 
-The centre IDs are read by Python, injected one by one into the `params` CTE of the main SQL, and written into the same target table.
+---
 
-## Repository Layout
+## Prerequisites
 
-```text
-.
-├── config.py
-├── db.py
-├── run_production_users_by_centre.py
-├── sql_queries/
-│   ├── production_user_one_record_subject_project_combo.sql
-│   └── centre_ids_limit_10.sql
-├── .env.example
-└── .gitignore
-```
+- Python 3.11+
+- SSH access to both bastion hosts (`.pem` key files):
+  - `<source-key>.pem` — source DB bastion
+  - `<dest-key>.pem` — analytics DB bastion
+- Both `.pem` files must be placed inside `DB_Config/` within the pipeline folder:
+  ```
+  ael_v2_pipeline/
+  ├── DB_Config/
+  │   ├── <source-key>.pem
+  │   └── <dest-key>.pem
+  └── ...
+  ```
+- Network access to both bastion IPs (VPN or office network as required)
 
-Key files:
+---
 
-- `run_production_users_by_centre.py`: Python entry point for centre-by-centre execution.
-- `sql_queries/production_user_one_record_subject_project_combo.sql`: Main MySQL 8 SQL query that returns one row per user.
-- `sql_queries/centre_ids_limit_10.sql`: Safe example centre-list query.
-- `db.py`: MySQL connection, SSH tunnel, fetch, and write helpers.
-- `config.py`: Environment-driven source and destination DB configuration.
-- `.env.example`: Placeholder environment configuration. Copy this to `.env` locally and fill in real values.
-
-## What The Runner Does
-
-For each centre ID:
-
-1. Reads the main SQL template.
-2. Replaces values inside the `params` CTE:
-   - `user_id = NULL`
-   - `centre_id = current centre ID`
-   - `batch_id = NULL`
-3. Runs the SQL against the source database.
-4. Appends the returned rows into one destination table.
-
-The target table is not split by centre. All rows are written into the same table, with `centre_id` available as a column in the output.
-
-## Requirements
-
-- Python 3.10 or newer
-- MySQL 8 or newer on the source database
-- Python packages:
+## Installation
 
 ```bash
+# 1. Navigate to the pipeline folder
+cd "AEL V2/ael_v2_pipeline"
+
+# 2. Create and activate a virtual environment
+python3 -m venv venv
+source venv/bin/activate          # macOS / Linux
+# venv\Scripts\activate           # Windows
+
+# 3. Install dependencies
 pip install -r requirements.txt
 ```
 
-The source SQL uses CTEs and window functions such as `ROW_NUMBER()`, so MySQL 8+ is required.
+**Dependencies:**
 
-## Environment Setup
+| Package | Purpose |
+|---|---|
+| `pandas >= 2.0` | DataFrame operations, merging, CSV export |
+| `pymysql >= 1.1` | MySQL driver — cursor-based queries and batch inserts |
+| `paramiko >= 3.0` | SSH client for tunnel implementation (replaces sshtunnel) |
+| `python-dotenv >= 1.0` | Loads `.env` credentials into environment variables |
+| `SQLAlchemy >= 2.0` | Retained for compatibility; not used for active queries |
+| `duckdb >= 0.10` | Local columnar cache — stores source tables and allocation results |
 
-Copy the example file:
+> **Why no `sshtunnel`?** The `sshtunnel` library (v0.4.0) references `paramiko.DSSKey` which was removed in paramiko 3.x. The pipeline uses a custom local port forwarder built directly on `paramiko` — see [SSH Tunnel Architecture](#ssh-tunnel-architecture).
+
+---
+
+## Configuration
+
+Credentials live in `.env` — never commit this file.
 
 ```bash
 cp .env.example .env
+# then fill in the two passwords
 ```
 
-Fill in `.env` with your local database and SSH tunnel values.
+Full `.env` reference:
 
-Required source DB variables:
+```ini
+# ── Source DB (quest_rearch_production) ──────────────────────
+SOURCE_SSH_HOST=<bastion-ip>
+SOURCE_SSH_PORT=22
+SOURCE_SSH_USER=<ssh-username>
+SOURCE_SSH_PKEY_FILE=<keyfile>.pem      # filename only — must be in DB_Config/
 
-```text
-SOURCE_SSH_HOST=
-SOURCE_SSH_PORT=
-SOURCE_SSH_USER=
-SOURCE_SSH_PKEY_FILE=
-SOURCE_RDS_HOST=
-SOURCE_RDS_PORT=
-SOURCE_DB_USER=
-SOURCE_DB_PASSWORD=
-SOURCE_DB_NAME=
+SOURCE_RDS_HOST=<rds-endpoint>
+SOURCE_RDS_PORT=3306
+
+SOURCE_DB_USER=<db-username>
+SOURCE_DB_PASSWORD=                     # ← fill this in
+SOURCE_DB_NAME=quest_rearch_production
+
+# ── Destination DB (quest_ple_analytics) ──────────────────────
+DEST_SSH_HOST=<bastion-ip>
+DEST_SSH_PORT=22
+DEST_SSH_USER=<ssh-username>
+DEST_SSH_PKEY_FILE=<keyfile>.pem        # filename only — must be in DB_Config/
+
+DEST_RDS_HOST=<rds-endpoint>
+DEST_RDS_PORT=3306
+
+DEST_DB_USER=<db-username>
+DEST_DB_PASSWORD=                       # ← fill this in
+DEST_DB_NAME=quest_analytics
+
+# ── Output ────────────────────────────────────────────────────
+OUTPUT_DIR=output
 ```
 
-Required destination DB variables:
+The `.pem` key filenames are resolved against `DB_Config/` inside the pipeline folder.
 
-```text
-DEST_SSH_HOST=
-DEST_SSH_PORT=
-DEST_SSH_USER=
-DEST_SSH_PKEY_FILE=
-DEST_RDS_HOST=
-DEST_RDS_PORT=
-DEST_DB_USER=
-DEST_DB_PASSWORD=
-DEST_DB_NAME=
+> **Never commit `.env`** — only `.env.example` (with blank passwords) belongs in version control.
+
+---
+
+## Project Structure
+
+```
+ael_v2_pipeline/
+│
+├── .env.example          # Template — copy to .env and fill passwords
+├── requirements.txt      # Python dependencies
+│
+├── config.py             # Loads .env → builds SOURCE_DB, ANALYTICS_DB dicts
+│                         # Constants: LEARNER_TYPES (3,4), STAFF_TYPES (1,2),
+│                         #   ALL_TYPES (1,2,3,4), CHUNK_SIZE, ALLOC_CHUNK_SIZE (2000),
+│                         #   STAFF_ALLOC_CHUNK_SIZE (200), OUTPUT_DIR
+│
+├── db.py                 # Low-level DB helpers (SSH tunnel + MySQL):
+│                         #   fetch()            — SELECT query → DataFrame
+│                         #   write_table()      — DataFrame → MySQL table (chunked)
+│                         #   delete_user_rows() — removes rows for specific users
+│                         # Tunnel: custom local port forwarder (paramiko direct-tcpip)
+│
+├── steps/
+│   ├── __init__.py
+│   │
+│   ├── s0_cache.py       # DuckDB local cache manager — two classes:
+│   │                     #
+│   │                     #   TableCache
+│   │                     #     refresh()                  — fetch source tables from production → DuckDB
+│   │                     #     refresh_completion_tables()— fetch learning_activities in batches
+│   │                     #                                  incremental by default (completed_at > last_ts)
+│   │                     #     make_fetch_fn()            — returns DuckDB-backed fetch (drop-in for db.fetch)
+│   │                     #     log_status()               — print per-table row count + cached_at
+│   │                     #     is_fresh()                 — True if all source tables are cached
+│   │                     #
+│   │                     #   AllocationCache
+│   │                     #     allocation_changed()       — compare 8 table row counts vs snapshot
+│   │                     #     save_row_count_snapshot()  — store current counts after run
+│   │                     #     append(df)                 — add chunk to allocation_cache table
+│   │                     #     finalise(total_rows)       — mark cache complete
+│   │                     #     load_chunk(user_ids)       — load allocation from DuckDB by user_ids
+│   │                     #     reset()                    — drop allocation_cache for rebuild
+│   │
+│   ├── s0_changed_users.py  # Incremental mode: finds user_ids with new completions
+│   │                        # since a given timestamp (queries learning_activities.completed_at)
+│   │
+│   ├── s1_users.py       # Fetch active users ALL types (1–4) with student_details profile
+│   │                     # fetch_fn=None param — uses DuckDB when cache is active
+│   │
+│   ├── s2_allocation.py  # Core allocation logic — three paths:
+│   │                     #   fetch_non_ple_allocation()   — learner/alumni non-PLE
+│   │                     #   fetch_ple_allocation()       — learner/alumni PLE
+│   │                     #   fetch_staff_allocation()     — Admin + Facilitator/MT
+│   │                     #   fetch_allocation(paths=...)  — combined, deduplicated
+│   │                     # All functions accept fetch_fn=None (DuckDB or production)
+│   │
+│   ├── s3_completion.py  # Completion data — accepts fetch_fn=None:
+│   │                     #   fetch_student_completion()     — learning_activities
+│   │                     #   fetch_facilitator_completion() — facilitator_learning_activities
+│   │                     #   fetch_completion()             — auto-routes by user_type
+│   │                     #   merge_completion()             — LEFT JOIN + summary + filter
+│   │
+│   └── s4_users_project_phase_json.py
+│                         # One-row-per-user JSON builder (analytics DB only):
+│                         #   fetch_users_project_phase()    — main_users LEFT JOIN main_centre_project + main_phases
+│                         #   fetch_subjects()               — main_learning_activity_myquest_ael
+│                         #   build_users_project_phase_json() — collapse to project_phase_combos JSON per user
+│                         #   build_subject_json()           — collapse to subject_combos JSON per user
+│                         #   run_users_project_phase_json() — orchestrates all four, returns merged DataFrame
+│
+├── main.py               # CLI entry point / orchestrator (Steps 1–3)
+├── main_wcc_json_v2.py   # CLI entry point for Step 4 (JSON output)
+├── cache.duckdb          # Local DuckDB cache file (gitignored — auto-created on first run)
+│                         # Args: --user-id, --centre-id, --batch-id, --subject-id,
+│                         #       --trade-id, --output db(default)/csv/both,
+│                         #       --outputs, --all-lesson-types, --since, --dry-run,
+│                         #       --log-file
+│
+├── DB_Config/            # SSH private key files (.pem) — NOT committed
+└── output/               # Default CSV output directory (only with --output csv/both)
 ```
 
-Private key files should be stored in `DB_Config/`.
+---
 
-Do not commit `.env`, private keys, or `DB_Config/`.
+## Pipeline Steps
 
-## Centre List SQL
+### Step 1 — User Fetch (`s1_users.py`)
 
-Use a separate SQL file to control which centres are processed.
+Fetches all active users across all four user types with their student profile.
 
-A safe example is included:
+**Source tables:** `users` LEFT JOIN `student_details`
+
+**Filters applied:**
+- `users.type IN (1, 2, 3, 4)` — Admin, Facilitator/Master Trainer, Learner, Alumni
+- `users.status = 1` — active accounts only
+- `users.deleted_at IS NULL` — non-deleted only
+
+**Key fields returned:**
+
+| Field | Source | Notes |
+|---|---|---|
+| `user_id` | `users.id` | Primary identifier (UUID) |
+| `user_type` | `users.type` | 1=Admin, 2=Facilitator/MT, 3=Learner, 4=Alumni |
+| `is_master_trainer` | `users.is_master_trainer` | Distinguishes Facilitator vs Master Trainer (type 2) |
+| `centre_id` | `users.centre_id` | Drives subject allocation |
+| `is_ple` | `users.is_ple` | Routes learners/alumni to PLE or non-PLE path |
+| `batch_id` | `student_details.batch_id` | NULL for staff — not used in staff allocation |
+| `trade_id` | `student_details.trade_id` | NULL for staff and PLE users |
+
+> Staff users (types 1, 2) will have NULL for all `student_details` columns — this is expected. Their allocation is driven by `centre_id` only.
+
+---
+
+### Step 2 — Toolkit Allocation (`s2_allocation.py`)
+
+Builds the full list of subjects and lessons each user is allocated. Three independent allocation paths are run, then combined.
+
+```python
+fetch_allocation(
+    user_ids=None,               # list of UUIDs — used by chunked loop
+    centre_id=None, batch_id=None,
+    subject_id=None, trade_id=None,
+    paths=("non_ple", "ple", "staff"),  # which paths to run
+)
+```
+
+The `paths` parameter lets each chunk run only the relevant subset (learner chunks skip `staff`, staff chunks skip `non_ple` and `ple`).
+
+See [Allocation Logic](#allocation-logic) for full join chains and filtering rules.
+
+---
+
+### Step 3 — Completion & Merge (`s3_completion.py`)
+
+Fetches raw lesson activity data and LEFT JOINs it onto the allocation result.
+
+```python
+fetch_completion(user_ids, user_types={3,4})  # auto-routes by type; user_ids required
+merge_completion(allocation_df, completion_df) # LEFT JOIN + summary stats + stubs
+```
+
+**Source table routing:**
+
+| User type | Source table |
+|---|---|
+| 3, 4 (Learner, Alumni) | `learning_activities` |
+| 1, 2 (Admin, Facilitator/MT) | `facilitator_learning_activities` |
+
+`main.py` extracts the unique `user_type` values from the allocation DataFrame and passes them to `fetch_completion()` — routing is automatic and transparent.
+
+---
+
+### Step 4 — User Project/Phase JSON (`s4_users_project_phase_json.py`)
+
+Builds a **one-row-per-user** JSON output table (`quest_analytics.main_wcc_json`) that consolidates project, phase, and subject data per user. Because a single user can belong to multiple projects and phases, repeating values are collapsed into two JSON columns instead of producing multiple rows.
+
+**Source tables (all from `quest_analytics`):**
+
+| Table | Role |
+|---|---|
+| `main_users` | Base user list — one row per user, drives the output shape |
+| `main_centre_project` | Maps centre → project (LEFT JOIN on `centre_id`) |
+| `main_phases` | Maps batch + centre + project + user → phase (LEFT JOIN, inner join on `p_user_id`) |
+| `main_learning_activity_myquest_ael` | Subject-level completion data for `subject_combos` JSON |
+
+**Join logic:**
+
+```
+main_users u
+  LEFT JOIN main_centre_project cp  ON cp.centre_id   = u.centre_id
+  LEFT JOIN main_phases ph          ON ph.p_batch_id   = u.batch_id
+                                    AND ph.p_centre_id  = u.centre_id
+                                    AND ph.p_project_id = cp.project_id
+                                    AND ph.p_user_id    = u.id
+```
+
+**Output JSON columns:**
+
+`project_phase_combos` — one entry per unique project/phase combination the user belongs to:
+
+| Field | Source |
+|---|---|
+| `prog_name` | `main_centre_project.program_name` |
+| `project_id` | `main_centre_project.project_id` |
+| `proj_name` | `main_centre_project.project_name` |
+| `p_phase_id` | `main_phases.p_phase_id` |
+| `phase` | `main_phases.phase_name` |
+
+`subject_combos` — one entry per subject allocated and/or completed by the user:
+
+| Field | Source |
+|---|---|
+| `sub_id` | `subject_id` |
+| `sub_name` | `subject_name` |
+| `avg_score_a` | `avg_score` |
+| `avg_rating_a` | `avg_rating` |
+| `c_sub_w_less_asse_c` | `subj_total_completed` |
+| `a_sub_w_less_asse_c` | `subj_total_allocated` |
+| `a_sub_w_assess_c` | `subj_assessments_allocated` |
+| `a_sub_w_lesson_c` | `subj_lessons_allocated` |
+| `c_sub_w_assess_c` | `subj_assessments_completed` |
+| `c_sub_w_less_c` | `subj_lessons_completed` |
+| `year_category` | `year_to_map` |
+
+**Key functions:**
+
+| Function | Description |
+|---|---|
+| `fetch_users_project_phase()` | Fetches the joined user + project/phase rows from analytics DB |
+| `fetch_subjects()` | Fetches subject-level rows from `main_learning_activity_myquest_ael` |
+| `build_users_project_phase_json()` | Collapses multi-row join result into one row per user with `project_phase_combos` JSON |
+| `build_subject_json()` | Collapses subject rows into `subject_combos` JSON per user |
+| `run_users_project_phase_json()` | Orchestrates all four functions and merges the result |
+
+All filters (`--user-id`, `--centre-id`, `--batch-id`) are passed through to both fetch functions so scoped runs work correctly.
+
+**Running step 4 via `main_wcc_json_v2.py`:**
 
 ```bash
-sql_queries/centre_ids_limit_10.sql
+# Full refresh into quest_analytics.main_wcc_json
+python main_wcc_json_v2.py
+
+# Dry run only
+python main_wcc_json_v2.py --dry-run
+
+# Test one user, write to CSV
+python main_wcc_json_v2.py --user-id <tlo_user_id> --output csv
+
+# Write both CSV and DB
+python main_wcc_json_v2.py --output both
 ```
 
-Example content:
+**Querying the JSON output in MySQL:**
 
 ```sql
-SELECT c.id
-FROM centres c
-LIMIT 10;
+-- Find all users in a specific project and phase
+SELECT DISTINCT u.*
+FROM quest_analytics.main_wcc_json u
+JOIN JSON_TABLE(
+    u.project_phase_combos,
+    '$[*]' COLUMNS (
+        proj_name VARCHAR(255) PATH '$.proj_name',
+        phase     VARCHAR(255) PATH '$.phase'
+    )
+) jt
+WHERE jt.proj_name = 'Project A'
+  AND jt.phase = 'Phase 1';
+
+-- Find all users with a specific subject
+SELECT DISTINCT u.tlo_user_id, u.centre_name
+FROM quest_analytics.main_wcc_json u
+JOIN JSON_TABLE(
+    u.subject_combos,
+    '$[*]' COLUMNS (
+        sub_name VARCHAR(255) PATH '$.sub_name'
+    )
+) jt
+WHERE jt.sub_name = 'Digital Literacy';
 ```
 
-For local work, you can create your own:
+> The JSON structure follows the same field names used in `Cust JSON version/json_main_wcc_try.ipynb` for consistency with the existing WCC JSON pipeline.
+
+---
+
+## Allocation Logic
+
+### Non-PLE Path
+
+For learners/alumni (`users.type IN (3,4)`) where `users.is_ple != 1`.
+
+A subject is allocated if it appears at the **intersection** of the user's centre, batch, and trade mappings. Batch and trade are **optional** — if the user has no `batch_id` or `trade_id`, the corresponding intersection check is skipped and the centre subjects pass through.
+
+```
+centre_subject   (always applied — base set)
+    ∩  (only if batch_id is not NULL)
+batch_subject
+    ∩  (only if trade_id is not NULL)
+subject_trade
+```
+
+**Full join chain (simplified):**
+
+```sql
+users
+  LEFT JOIN student_details sd   ON sd.user_id = u.id
+  JOIN centre_subject cs         ON cs.centre_id = u.centre_id
+  LEFT JOIN batch_subject bs
+      ON  sd.batch_id IS NOT NULL
+      AND bs.batch_id   = sd.batch_id
+      AND bs.subject_id = cs.subject_id
+  LEFT JOIN subject_trade st
+      ON  sd.trade_id IS NOT NULL
+      AND st.trade_id   = sd.trade_id
+      AND st.subject_id = cs.subject_id
+  LEFT JOIN trades t_trade       ON t_trade.id = sd.trade_id
+  JOIN subjects s                ON s.id = cs.subject_id
+  JOIN lessons l                 ON l.subject_id = s.id
+                                    AND l.student_access = 1
+  LEFT JOIN lesson_types lt      ON lt.id = l.lesson_type_id
+
+WHERE u.type IN (3, 4)
+  AND u.status = 1 AND u.deleted_at IS NULL
+  AND (u.is_ple IS NULL OR u.is_ple != 1)
+  AND s.is_ple IN (0, 2)
+  AND (sd.batch_id IS NULL OR bs.subject_id IS NOT NULL)
+  AND (sd.trade_id IS NULL OR st.subject_id IS NOT NULL)
+  AND year_to_map filter...
+```
+
+**Intersection examples:**
+
+| User has | What is checked |
+|---|---|
+| centre_id only | Centre subjects only |
+| centre_id + batch_id | Centre ∩ Batch |
+| centre_id + trade_id | Centre ∩ Trade |
+| centre_id + batch_id + trade_id | Centre ∩ Batch ∩ Trade |
+
+---
+
+### PLE Path
+
+For learners/alumni (`users.type IN (3,4)`) where `users.is_ple = 1`.
+
+```
+centre_subject   (always applied)
+    ∩  (only if career path exists)
+subject_ple_career_path
+    ∩  (only if batch_id is not NULL)
+batch_subject
+```
+
+Career path is resolved via:
+```
+ple_career_path_user (user_id = users.id, status=1, deleted_at IS NULL, latest by updated_at)
+    → ple_career_paths (id = job_type_id, deleted_at IS NULL)
+```
+
+Only the **most recently updated** active career path is joined (enforced via `ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY updated_at DESC) = 1`).
+
+---
+
+### Staff Path
+
+For Admin (type 1) and Facilitator/Master Trainer (type 2). No batch, trade, or career path joins — allocation is driven by **centre subjects only**.
+
+```sql
+users u
+  JOIN centre_subject cs ON cs.centre_id = u.centre_id
+  JOIN subjects s        ON s.id = cs.subject_id AND s.status = 1
+  JOIN lessons l         ON l.subject_id = s.id AND l.status = 1
+  LEFT JOIN lesson_types lt ON lt.id = l.lesson_type_id
+
+WHERE u.type IN (1, 2)
+  AND u.status = 1 AND u.deleted_at IS NULL
+  AND s.is_ple IN (0, 1, 2)
+  AND (
+      u.type = 1                                                         -- Admin: all lessons
+      OR (u.type = 2 AND (u.is_master_trainer IS NULL OR u.is_master_trainer != 1)
+          AND l.facilitator_access = 1)                                  -- Facilitator
+      OR (u.type = 2 AND u.is_master_trainer = 1
+          AND l.mastertrainer_access = 1)                                -- Master Trainer
+  )
+```
+
+| Staff role | `is_master_trainer` | Lesson access filter |
+|---|---|---|
+| Admin (type 1) | any | All lessons in the centre |
+| Facilitator (type 2) | NULL or 0 | `facilitator_access = 1` |
+| Master Trainer (type 2) | 1 | `mastertrainer_access = 1` |
+
+Staff have access to subjects regardless of `subjects.is_ple` — they can see both QuestApp and MyQuest subjects in their centre.
+
+---
+
+### Optional Batch / Trade Intersection
+
+The NULL guards on the JOIN ON clauses ensure that MySQL skips scanning the mapping tables when the key is NULL — making the optional intersection zero-cost rather than causing a full table scan:
+
+```sql
+-- Only join batch_subject when the user actually has a batch_id
+LEFT JOIN batch_subject bs
+    ON  sd.batch_id IS NOT NULL          -- MySQL skips scan when NULL
+    AND bs.batch_id   = sd.batch_id
+    AND bs.subject_id = cs.subject_id
+
+-- Then in WHERE: include the subject if there was no batch_id to check
+AND (sd.batch_id IS NULL OR bs.subject_id IS NOT NULL)
+```
+
+---
+
+### Year-to-Map Filtering
+
+`subjects.year_to_map` restricts which year of a multi-year trade programme a subject belongs to. Applies to learner/alumni paths only (staff have no trade).
+
+| Trade duration | Subjects included |
+|---|---|
+| 1 year | Only `year_to_map = 1` (or NULL / 0) |
+| 2 years | `year_to_map = 1` **and** `year_to_map = 2` |
+
+**Pass-through** (subject always included): `year_to_map IS NULL`, `year_to_map = 0`, `trades.duration IS NULL`.
+
+---
+
+### Subject Platform Filter (`subjects.is_ple`)
+
+| `subjects.is_ple` | Platform | Allocated to |
+|---|---|---|
+| `0` | QuestApp | Non-PLE users only |
+| `1` | MyQuest | PLE users only |
+| `2` | Both | All users |
+
+- Non-PLE query: `AND s.is_ple IN (0, 2)`
+- PLE query: `AND s.is_ple IN (1, 2)`
+- Staff query: `AND s.is_ple IN (0, 1, 2)` — all platforms
+
+---
+
+### Data Quality Rules
+
+| Entity | Rule |
+|---|---|
+| `users` | `status = 1` AND `deleted_at IS NULL` AND `type IN (1, 2, 3, 4)` |
+| `subjects` | `status = 1` AND `deleted_at IS NULL` |
+| `lessons` | `status = 1` AND `deleted_at IS NULL` AND access flag per user type |
+| `ple_career_paths` | `deleted_at IS NULL` |
+| `ple_career_path_user` | `status = 1` AND `deleted_at IS NULL` |
+
+**Multi-career-path deduplication:** PLE users with more than one active career path produce one row per career path per shared lesson. `fetch_allocation()` deduplicates on `(user_id, lesson_id)`, keeping the **most recently updated** career path row. The `career_path_updated_at` helper column is dropped after dedup.
+
+---
+
+## Completion Logic
+
+### Source Table Routing
+
+| User type | Source table |
+|---|---|
+| 3 (Learner), 4 (Alumni) | `learning_activities` |
+| 1 (Admin), 2 (Facilitator/MT) | `facilitator_learning_activities` |
+
+Per `(user_id, lesson_id)` the query computes: `MAX(score)`, `MAX(rating)`, `SUM(duration)`. `data_from` is always `NULL AS data_from` (column does not exist in the source tables).
+
+### Completed = 1 Filter
+
+Enforced at two layers:
+
+**Layer 1 — SQL:** `WHERE completed = 1` in `s3_completion.py`. Only records explicitly marked completed are fetched. Viewed-only or in-progress records are excluded at the DB level.
+
+**Layer 2 — Python:** `merge_completion()` LEFT JOINs completion onto allocation. Lessons in the allocation with no `completed = 1` record get `completed = 0`. Summary stats are computed on the **full merged dataset** before this filter, so `total_allocated`, `total_completed`, and `completion_pct` are accurate. The final returned DataFrame contains only `completed = 1` rows plus zero-completion stub rows.
+
+---
+
+## Output Schema
+
+### DB Tables Written (every run)
+
+| Table | Contents | Lesson type filter |
+|---|---|---|
+| `main_learning_activity_myquest_ael_lesson` | Lesson-level (one row per user × completed lesson) | pdf / mp4 / pdf web **excluded** |
+| `main_learning_activity_myquest_ael` | Subject-level aggregation (one row per user × subject) | pdf / mp4 / pdf web **excluded** |
+| `main_learning_activity_myquest_ael_all_lesson_type` | Subject-level aggregation | **All lesson types included** |
+
+The first two tables are written per-chunk during the run. The all-lesson-type table is written once after all chunks complete.
+
+---
+
+### Lesson-Level Output (`main_learning_activity_myquest_ael_lesson`)
+
+One row per **user × completed lesson**. Users with zero completions get a single stub row with lesson/subject fields NULL and `completed = 0`.
+
+| Column | Type | Description |
+|---|---|---|
+| `user_id` | string | User UUID |
+| `user_name` | string | Full name |
+| `user_type` | int | 1=Admin, 2=Facilitator/MT, 3=Learner, 4=Alumni |
+| `is_master_trainer` | int | 1 = Master Trainer (type 2 only) |
+| `centre_id` | string | Centre UUID |
+| `project_id` | string | Project UUID |
+| `batch_id` | string | Batch UUID (NULL for staff) |
+| `trade_id` | string | Trade UUID (non-PLE only; NULL for PLE and staff) |
+| `career_path_id` | string | PLE career path UUID (PLE only) |
+| `career_path_name` | string | PLE career path name (PLE only) |
+| `subject_id` | string | Subject UUID |
+| `subject_name` | string | Subject name |
+| `subject_is_ple` | int | PLE flag on the subject (0 / 1 / 2) |
+| `ple_career_path_id` | string | Career path linked directly on the subject |
+| `year_to_map` | int | Year restriction on the subject (NULL = unrestricted) |
+| `trade_duration` | int | Duration of the user's trade (NULL for staff) |
+| `subject_order` | int | Display order from `centre_subject` |
+| `lesson_id` | string | Lesson UUID |
+| `lesson_name` | string | Lesson name |
+| `lesson_order` | int | Display order within the subject |
+| `lesson_type` | string | e.g. Video, PDF, Assessment |
+| `is_assessment` | int | 1 = assessment, 0 = learning content |
+| `toolkit_type` | string | `student` / `facilitator` / `master` |
+| `allocation_path` | string | `non_ple` / `ple` / `staff` |
+| `allocation_basis` | string | Which mapping tables allocated this row |
+| `score` | float | Best score (NULL if not attempted) |
+| `rating` | float | Best rating (NULL if not rated) |
+| `duration` | int | Total time on this lesson across completed attempts (seconds) |
+| `data_from` | string | Always NULL — not in source tables |
+| `completed` | int | `1` = completed; `0` = zero-completion stub |
+| `total_allocated` | int | All lessons allocated to this user |
+| `total_lessons_allocated` | int | Non-assessment lessons allocated |
+| `total_assessments_allocated` | int | Assessment lessons allocated |
+| `total_completed` | int | All lessons completed by this user |
+| `total_lessons_completed` | int | Non-assessment lessons completed |
+| `total_assessments_completed` | int | Assessment lessons completed |
+| `completion_pct` | float | `(total_completed / total_allocated) × 100`, 2dp |
+| `subj_total_allocated` | int | Total lessons allocated in this subject |
+| `subj_lessons_allocated` | int | Non-assessment lessons allocated in this subject |
+| `subj_assessments_allocated` | int | Assessment lessons allocated in this subject |
+| `subj_total_completed` | int | Lessons completed in this subject |
+| `subj_lessons_completed` | int | Non-assessment lessons completed in this subject |
+| `subj_assessments_completed` | int | Assessment lessons completed in this subject |
+
+> **`is_assessment` detection:** A lesson is classified as an assessment if `lessons.is_assessment = 1` **OR** `UPPER(lesson_name) LIKE '%ASSESSMENT%'`. This catches lessons where the DB flag was never set.
+
+> **Zero-completion stub rows:** Users allocated lessons but with no completed records appear as a single stub row. All lesson/subject columns are NULL. User-level stats are filled in with `completed = 0`.
+
+---
+
+### Subject-Level Aggregation (`main_learning_activity_myquest_ael`)
+
+One row per **user × subject**. Filtered — pdf / mp4 / pdf web lesson types excluded.
+
+| Column | Type | Description |
+|---|---|---|
+| `user_id` | string | User UUID |
+| `user_name` | string | Full name |
+| `user_type` | int | 1=Admin, 2=Facilitator/MT, 3=Learner, 4=Alumni |
+| `centre_id` | string | Centre UUID |
+| `project_id` | string | Project UUID |
+| `batch_id` | string | Batch UUID (NULL for staff) |
+| `trade_id` | string | Trade UUID (non-PLE only) |
+| `career_path_id` | string | PLE career path UUID |
+| `career_path_name` | string | PLE career path name |
+| `subject_id` | string | Subject UUID |
+| `subject_name` | string | Subject name |
+| `subject_is_ple` | int | PLE flag (0 / 1 / 2) |
+| `year_to_map` | int | Year restriction on the subject |
+| `allocation_basis` | string | Which mapping tables allocated this subject |
+| `total_allocated` | int | All lessons allocated to this user |
+| `total_lessons_allocated` | int | Non-assessment lessons allocated |
+| `total_assessments_allocated` | int | Assessment lessons allocated |
+| `total_completed` | int | All lessons completed |
+| `total_lessons_completed` | int | Non-assessment lessons completed |
+| `total_assessments_completed` | int | Assessment lessons completed |
+| `completion_pct` | float | Completion percentage, 2dp |
+| `subj_total_allocated` | int | Lessons allocated in this subject |
+| `subj_lessons_allocated` | int | Non-assessment lessons in this subject |
+| `subj_assessments_allocated` | int | Assessment lessons in this subject |
+| `subj_total_completed` | int | Lessons completed in this subject |
+| `subj_lessons_completed` | int | Non-assessment lessons completed |
+| `subj_assessments_completed` | int | Assessment lessons completed |
+| `avg_score` | float | Average score across completed lessons in this subject |
+| `avg_rating` | float | Average rating across completed lessons |
+| `avg_duration` | float | Average time per completed lesson (seconds) |
+| `total_duration` | int | Total time across all completed lessons (seconds) |
+
+---
+
+### All-Lesson-Type Subject Aggregation (`main_learning_activity_myquest_ael_all_lesson_type`)
+
+Same schema as `main_learning_activity_myquest_ael` above, but **includes pdf, mp4, and pdf web lesson types** in all counts and averages. Always written on every run alongside the filtered table.
+
+---
+
+## Running the Pipeline
+
+### All Users — Full Refresh
 
 ```bash
-sql_queries/centre_ids.sql
+cd ael_v2_pipeline
+source venv/bin/activate
+python main.py
 ```
 
-That file is ignored by Git because it may contain real programme IDs, project IDs, centre filters, or other operational details.
+Processes all active users (types 1–4). Writes to analytics DB (default). On first chunk it drops and recreates both filtered tables, then each subsequent chunk appends.
 
-## Run The Pipeline
+**When to run a full refresh:**
 
-Run with the example centre list and recreate the destination table on the first non-empty result:
+| Situation | Action |
+|---|---|
+| First time running | Full refresh |
+| Allocation mappings changed (batch, trade, career path) | Full refresh |
+| A subject or lesson was added/removed | Full refresh |
+| Tables corrupted or out of sync | Full refresh |
+| Routine daily update (completion data only changed) | Incremental `--since` — much faster |
+
+> Full refresh for 900K+ users takes ~5 hours. Run during off-hours to avoid incomplete data in dashboards during the rebuild window.
+
+---
+
+### Single User
 
 ```bash
-python3 run_production_users_by_centre.py \
-  --centre-sql-path sql_queries/centre_ids_limit_10.sql \
-  --target-table production_users_one_record \
-  --replace-target
+python main.py --user-id <user-uuid> --output csv
 ```
 
-Run with your local centre-list SQL:
+---
+
+### Filter Options
+
+All filters are optional and can be freely combined:
+
+| Flag | Filters on |
+|---|---|
+| `--user-id <uuid>` | Single user |
+| `--centre-id <uuid>` | All users in a centre |
+| `--batch-id <uuid>` | All users in a batch |
+| `--subject-id <uuid>` | One specific subject only |
+| `--trade-id <uuid>` | Users in a specific trade |
+
+The startup log line shows all active filters:
+```
+[user_id=ALL | centre_id=0dd48495-... | batch_id=ALL | subject_id=ALL | trade_id=ALL | output=db | outputs=lesson,subject,debug | dry_run=False]
+```
+
+---
+
+### Output Options
+
+| Flag | Behaviour |
+|---|---|
+| *(default)* / `--output db` | Write to analytics DB tables only |
+| `--output csv` | Write CSV files to `OUTPUT_DIR/` only |
+| `--output both` | Write both DB tables and CSV files |
+
+**DB tables written on every run (when `--output db` or `--output both`):**
+
+| Table | Contents |
+|---|---|
+| `main_learning_activity_myquest_ael_lesson` | Lesson-level, filtered |
+| `main_learning_activity_myquest_ael` | Subject-level, filtered |
+| `main_learning_activity_myquest_ael_all_lesson_type` | Subject-level, all lesson types |
+
+**CSV files written (when `--output csv` or `--output both`):**
+
+| File | Contents |
+|---|---|
+| `lessons_filtered_<tag>_<ts>.csv` | Lesson-level, pdf/mp4/pdf web excluded |
+| `subjects_filtered_<tag>_<ts>.csv` | Subject-level, pdf/mp4/pdf web excluded |
+| `no_allocation_users_<ts>.csv` | Users with no allocation found |
+
+The `<tag>` reflects active filters: e.g. `ctr_0dd48495` for a centre run, `all_users` for a full run.
+
+**Common examples:**
 
 ```bash
-python3 run_production_users_by_centre.py \
-  --centre-sql-path sql_queries/centre_ids.sql \
-  --target-table production_users_one_record \
-  --replace-target
+python main.py                                               # all users → DB (full refresh)
+python main.py --output csv                                  # all users → CSV only
+python main.py --output both                                 # all users → CSV + DB
+python main.py --user-id <uuid> --output csv                 # single user to CSV
+python main.py --centre-id <uuid>                            # centre → DB
+python main.py --centre-id <uuid> --batch-id <uuid>          # combined filter
+python main.py --trade-id <uuid>                             # all users in a trade
+python main.py --subject-id <uuid>                           # all users, one subject
+python main.py --since "2026-04-30 00:00:00"                 # incremental mode
+python main.py --log-file /home/joseph/logs/ael.log          # also log to file
 ```
 
-Append to the existing destination table without recreating it:
+---
+
+### Controlling Which Outputs Are Written
 
 ```bash
-python3 run_production_users_by_centre.py \
-  --centre-sql-path sql_queries/centre_ids.sql \
-  --target-table production_users_one_record
+# Default: write lesson detail, subject aggregation, and debug CSV
+python main.py --outputs lesson,subject,debug
+
+# Skip debug output
+python main.py --outputs lesson,subject
+
+# Only write the subject-level aggregation
+python main.py --outputs subject
 ```
 
-Run the default first 10 centres without a separate centre-list file:
+The `debug` output writes a `debug_alloc_<tag>_<ts>.csv` showing the raw pre-completion allocation (with `allocation_basis`, `lesson_type`, etc.) for inspection. Only written on small runs (single chunk) when `--output csv` or `--output both` is active.
+
+---
+
+### All Lesson Types
+
+By default, pdf, mp4, and pdf web lessons are **excluded** from all CSV outputs and from `main_learning_activity_myquest_ael` / `main_learning_activity_myquest_ael_lesson`. The all-lesson-type DB table (`main_learning_activity_myquest_ael_all_lesson_type`) is **always written** regardless.
+
+To also get CSV files that include pdf/mp4/pdf web:
 
 ```bash
-python3 run_production_users_by_centre.py \
-  --target-table production_users_one_record \
-  --replace-target
+python main.py --output csv --all-lesson-types
+# or
+python main.py --output both --all-lesson-types
 ```
 
-Run all centres:
+This adds two extra CSV files:
+
+| File | Contents |
+|---|---|
+| `lessons_all_types_<tag>_<ts>.csv` | Lesson-level, all lesson types |
+| `subjects_all_types_<tag>_<ts>.csv` | Subject-level, all lesson types |
+
+---
+
+### Force Refresh Cache
 
 ```bash
-python3 run_production_users_by_centre.py \
-  --limit 0 \
-  --target-table production_users_one_record \
-  --replace-target
+python main.py --force-refresh
 ```
 
-## Command Options
+Bypasses both cache layers and rebuilds everything from production from scratch. Use this after a major data change or if the cache file becomes corrupted.
 
-```text
---sql-path
-    Path to the main SQL file.
-    Default: sql_queries/production_user_one_record_subject_project_combo.sql
+---
 
---centre-sql-path
-    Optional SQL file that returns centre IDs in the first column.
-
---target-table
-    Destination table name.
-    Default: production_users_one_record
-
---limit
-    Number of centres to process when --centre-sql-path is not provided.
-    Default: 10
-    Use 0 to process all centres.
-
---replace-target
-    Recreate the target table on the first non-empty centre result.
-    Without this flag, results are appended to the existing table.
-```
-
-## Rerun Behaviour
-
-Use `--replace-target` when you want a fresh rebuild:
+### Dry Run
 
 ```bash
-python3 run_production_users_by_centre.py \
-  --centre-sql-path sql_queries/centre_ids.sql \
-  --target-table production_users_one_record \
-  --replace-target
+python main.py --dry-run
+python main.py --centre-id <uuid> --dry-run
 ```
 
-Without `--replace-target`, the script appends rows. This is useful when extending a table, but it can create duplicates if you rerun the same centre list.
+Prints row counts and a summary without writing any output.
 
-## Sensitive Information Policy
+**Sample output (scoped run):**
 
-The repository is configured to avoid committing local secrets:
+```
+────────────────────────────────────────────────────────────
+  Users processed       : 4,821  (PLE: 312 | non-PLE: 4,509)
+  Unique subjects       : 148
+  Unique lessons        : 2,034
+  Total rows            : 97,210
+  Avg completion        : 43.7%
+────────────────────────────────────────────────────────────
+```
 
-- `.env` is ignored.
-- `*.pem` is ignored.
-- `DB_Config/` is ignored.
-- `sql_queries/centre_ids.sql` is ignored because local centre-list queries may include real IDs.
-- Generated outputs under `output/` are ignored.
+**Sample output (full multi-chunk run):**
 
-Before pushing to GitHub, check:
+```
+────────────────────────────────────────────────────────────
+  Users fetched         : 931,035
+  Users in output       : 931,035  (PLE: 12,480 | non-PLE: 903,291 | no-alloc: 15,264)
+  Avg completion        : 31.4%
+────────────────────────────────────────────────────────────
+```
+
+---
+
+### Compressed Log File
 
 ```bash
-git status --short
-git diff --cached
+python main.py --log-file /home/joseph/logs/ael_pipeline.log
 ```
 
-Do not stage files containing:
+Writes logs to a file in addition to stdout. Rotates daily at midnight; old files are gzip-compressed automatically. Kept for 30 days.
 
-- real passwords
-- private keys
-- database hostnames
-- SSH usernames
-- production-only IDs that should not be public
-- exported data
+---
 
-## Validation
+## Incremental Runs
 
-Syntax-check the Python files:
+After an initial full refresh, use `--since` to process only users with new completions. Typically completes in minutes.
 
 ```bash
-python3 -m py_compile db.py run_production_users_by_centre.py
+python main.py --since "YYYY-MM-DD HH:MM:SS"
 ```
 
-The pipeline itself requires live database access, so a full end-to-end run should only be done from an environment with valid SSH and DB credentials.
+Step 0 queries `learning_activities.completed_at` to find users with new completions. Only those users are fetched, allocated, and re-inserted. All other users keep their existing DB rows untouched.
+
+**Write strategy for incremental:**
+1. `DELETE FROM <table> WHERE user_id IN (...)` — remove stale rows
+2. `INSERT` fresh rows for changed users
+
+**When to use:**
+
+| Scenario | Mode |
+|---|---|
+| First deployment | Full refresh |
+| Daily scheduled update | Incremental |
+| Allocation mappings changed | Full refresh |
+| Output tables dropped/corrupted | Full refresh |
+
+**Cron example (runs at 00:05 daily):**
+
+```cron
+5 0 * * * cd /path/to/ael_v2_pipeline && /path/to/venv/bin/python main.py \
+  --since "$(date -d 'yesterday' '+%Y-%m-%d 00:00:00')" \
+  --log-file /var/log/ael_pipeline.log
+```
+
+> macOS: replace `date -d 'yesterday'` with `date -v-1d`.
+
+**Monthly full refresh:**
+
+```cron
+0 1 1 * * cd /path/to/ael_v2_pipeline && /path/to/venv/bin/python main.py \
+  --log-file /var/log/ael_pipeline_full.log
+```
+
+---
+
+## Large Runs and Chunked Processing
+
+Users are split into chunks and processed end-to-end per chunk to keep memory usage bounded. **Learners and staff use separate chunk sizes** because staff (especially Admins) produce many more rows per user.
+
+```
+After Step 1 — split into learner_ids (types 3,4) and staff_ids (types 1,2):
+
+  for each learner chunk of ALLOC_CHUNK_SIZE (2000) users:
+      Step 2: fetch_allocation(paths=("non_ple", "ple"))  — 2 queries
+      Step 3: fetch completion → merge → write to DB → discard
+
+  for each staff chunk of STAFF_ALLOC_CHUNK_SIZE (200) users:
+      Step 2: fetch_allocation(paths=("staff",))           — 1 query
+      Step 3: fetch completion → merge → write to DB → discard
+
+After loop:
+  Combine all unfiltered alloc frames → merge_completion → write to
+  main_learning_activity_myquest_ael_all_lesson_type
+```
+
+The separation means Admin-heavy chunks never inflate the learner query sizes, restoring the original 2-queries-per-chunk cadence for the learner path.
+
+**Configuration in `config.py`:**
+
+```python
+ALLOC_CHUNK_SIZE       = 2000   # learners per allocation query
+STAFF_ALLOC_CHUNK_SIZE = 200    # staff per allocation query (admins get many more rows)
+```
+
+**DB write strategy:**
+
+| Run type | First chunk | Subsequent chunks |
+|---|---|---|
+| Full refresh | DROP + CREATE + INSERT | INSERT (append) |
+| Incremental | DELETE user rows + INSERT | DELETE user rows + INSERT |
+
+---
+
+## Local DuckDB Cache
+
+### How It Works
+
+The pipeline uses a local DuckDB file (`cache.duckdb`) to cache source tables and allocation results. This eliminates the majority of SSH tunnel connections on every run — from ~6,600 connections down to ~9.
+
+| Step | No cache | Cache only | Cache + Result Buffer |
+|---|---|---|---|
+| s1 users | 1 | 0 (DuckDB) | 0 (DuckDB) |
+| s2 allocation | ~4,410 | 0 (DuckDB) | 0 (DuckDB) |
+| s3 completion | ~2,205 | 1 upfront | 1 upfront |
+| DB writes | ~1,270 | ~1,270 | 2 (bulk flush) |
+| Allocation change check | 0 | 8 COUNT(*) | 8 COUNT(*) |
+| **Total** | **~7,886** | **~1,280** | **~11** |
+
+The cache is only active for **full unscoped runs** (no `--user-id` / `--centre-id` / `--batch-id` / `--subject-id` / `--trade-id` filters, no `--since`). Scoped runs always use live production queries — they are fast and this keeps cache logic simple.
+
+---
+
+### Three-Layer Cache + Result Buffer Strategy
+
+**Layer 1 — Source Table Cache (`TableCache`)**
+
+Caches individual source tables from `quest_rearch_production` into DuckDB. Once cached, `s1_users` and `s2_allocation` run their existing SQL queries locally against DuckDB using a drop-in fetch function.
+
+SQL adaptations applied automatically:
+- `%s` → `?` (placeholder style)
+- `` `identifier` `` → `"identifier"` (quoting style)
+
+**Layer 1b — Completion Table Cache (incremental, deduplicated)**
+
+`learning_activities` and `facilitator_learning_activities` are cached with filters applied at source (`completed = 1`, active users, active lessons). Refreshed every run:
+- **Full refresh** (`--force-refresh`): fetches in batches of 2,000 user IDs, applies lesson filter in DuckDB, then deduplicates to one row per `(user_id, lesson_id)` keeping the most recent `completed_at`
+- **Incremental** (default): fetches only `WHERE completed_at > last_cached_ts`, upserts (delete old + insert new) so duplicates never accumulate
+
+**Layer 2 — Allocation Result Cache (`AllocationCache`)**
+
+After `s2_allocation` runs (against DuckDB), the full allocation result is saved chunk-by-chunk into `allocation_cache`. On subsequent runs where allocation is unchanged, each chunk loads directly from this result cache — skipping even the local DuckDB JOIN queries.
+
+**Result Buffer (`ResultBuffer`)**
+
+During the chunk loop, instead of opening 2 SSH connections per chunk to write to analytics DB, results are buffered in DuckDB (`_rbuf_lesson`, `_rbuf_subject`). After all chunks complete, a single bulk write streams everything to analytics DB via `fetchmany()` in 100k-row batches.
+
+Active for full unscoped runs (`start_chunk=1`, no `--since`). Falls back to per-chunk writes for `--start-chunk` resume and `--since` incremental.
+
+---
+
+### Source Table Cache (Layer 1)
+
+Tables cached from `quest_rearch_production`:
+
+| Table | Refresh trigger |
+|---|---|
+| `users` | When any allocation watch table row count changes |
+| `student_details` | Same |
+| `subjects` | Same |
+| `lessons` | Same |
+| `lesson_types` | Same |
+| `trades` | Same |
+| `centre_subject` | Same |
+| `batch_subject` | Same |
+| `subject_trade` | Same |
+| `ple_career_paths` | Same |
+| `subject_ple_career_path` | Same |
+| `ple_career_path_user` | Same |
+
+**Allocation watch tables** (row counts compared on every run to detect changes):
+`centre_subject`, `batch_subject`, `subject_trade`, `ple_career_paths`, `subject_ple_career_path`, `ple_career_path_user`, `subjects`, `lessons`
+
+---
+
+### Completion Table Cache (Incremental)
+
+`learning_activities` and `facilitator_learning_activities` are loaded with filters applied at source:
+- `completed = 1` only
+- Active users only (`status = 1`, `deleted_at IS NULL`, correct `type`)
+- Active lessons only — must appear in `centre_subject` JOIN `lessons` JOIN `subjects` (all active)
+
+**First run / `--force-refresh` — full batch refresh:**
+
+User IDs are read from the already-cached `users` table in DuckDB (no extra SSH). Records are fetched from production in batches of 5,000 user IDs at a time to avoid large single queries.
+
+After loading, `MAX(completed_at)` is stored in `cache_meta`.
+
+**Subsequent runs — incremental refresh:**
+
+Only fetches records where `completed_at > last_cached_ts` and appends them to the existing DuckDB table. The `s3_completion` SQL already uses `MAX(score)` / `SUM(duration)` with `GROUP BY (user_id, lesson_id)`, so any duplicate keys from incremental appends are correctly aggregated at query time.
+
+If no new records exist since the last run, the table is left untouched and a log line confirms it.
+
+---
+
+### Completion Table Deduplication
+
+A user who retries a lesson creates multiple records in `learning_activities` with the same `(user_id, lesson_id)`. The cache always keeps exactly one row per pair — the most recent attempt (`MAX(completed_at)`).
+
+**Full refresh dedup** — runs once after all batches load:
+```sql
+-- Keeps the latest attempt per (user_id, lesson_id)
+SELECT * EXCLUDE (_rn) FROM (
+    SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY user_id, lesson_id
+        ORDER BY completed_at DESC NULLS LAST
+    ) AS _rn FROM learning_activities
+) WHERE _rn = 1
+```
+
+**Incremental upsert** — on every normal run:
+1. Fetch new records (`completed_at > last_cached_ts`)
+2. Deduplicate new batch itself (if same pair retried twice in the window)
+3. DELETE existing cache rows for all affected `(user_id, lesson_id)` pairs
+4. INSERT the latest record for each pair
+
+This prevents duplicate rows from accumulating in the cache across runs.
+
+**Apply dedup to existing cache without re-fetching:**
+```bash
+python3 -c "
+import duckdb; con = duckdb.connect('cache.duckdb')
+for t in ['learning_activities', 'facilitator_learning_activities']:
+    con.execute(f'''CREATE TABLE _d AS SELECT * EXCLUDE (_rn)
+        FROM (SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY user_id, lesson_id
+                ORDER BY completed_at DESC NULLS LAST) AS _rn
+              FROM {t}) WHERE _rn = 1''')
+    con.execute(f'DROP TABLE {t}')
+    con.execute(f'ALTER TABLE _d RENAME TO {t}')
+    n = con.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
+    print(f'{t}: {n:,} unique rows')
+con.close()
+"
+```
+
+---
+
+### Allocation Result Cache (Layer 2)
+
+Built on top of Layer 1. After the allocation queries run (against DuckDB), the result for every chunk is appended to `allocation_cache`. On the next run:
+
+1. Row counts of the 8 allocation watch tables are checked (fast — 8 COUNT(*) queries)
+2. If unchanged → load each chunk's allocation directly from `allocation_cache` (single DuckDB SELECT WHERE user_id IN (...))
+3. If changed → drop `allocation_cache`, rebuild it from fresh allocation queries, save new snapshot
+
+---
+
+### Allocation Change Detection
+
+At pipeline startup, the `AllocationCache` runs a COUNT(*) on each of the 8 allocation watch tables and compares against the stored snapshot. The log output shows the result clearly:
+
+```
+[cache] ── Cache status: checking allocation tables ──────────────
+[cache]   centre_subject        ok        rows=45231    (snapped: 2026-06-02 17:30:00)
+[cache]   batch_subject         ok        rows=12840    (snapped: 2026-06-02 17:30:00)
+[cache]   subject_trade         ok        rows=8920     (snapped: 2026-06-02 17:30:00)
+[cache]   ple_career_paths      ok        rows=312      (snapped: 2026-06-02 17:30:00)
+[cache]   subjects              ok        rows=2841     (snapped: 2026-06-02 17:30:00)
+[cache]   lessons               ok        rows=28410    (snapped: 2026-06-02 17:30:00)
+[cache] ── Result: ALL CACHED  ✓ — allocation will load from DuckDB ─
+```
+
+If any table changed:
+
+```
+[cache]   centre_subject        CHANGED   stored=45231   current=45250    (snapped: 2026-06-02)
+[cache] ── Result: CHANGED (trigger: centre_subject) — full allocation refresh ─
+```
+
+---
+
+### Cache Log Output
+
+**Source table cache (startup):**
+```
+[table_cache] ── Cache status ──────────────────────────────────────
+[table_cache]   users                968765 rows  (cached: 2026-06-02 17:30:00)
+[table_cache]   student_details      935509 rows  (cached: 2026-06-02 17:30:00)
+[table_cache]   subjects               2841 rows  (cached: 2026-06-02 17:30:00)
+[table_cache]   lessons               28410 rows  (cached: 2026-06-02 17:30:00)
+...
+[table_cache] s1 + s2 + s3 will all query DuckDB cache this run
+```
+
+**Completion table cache (every run — incremental):**
+```
+[table_cache] ── learning_activities: incremental refresh ─────────────
+[table_cache]   last cached completed_at : 2026-06-02 17:45:23
+[table_cache]   fetching records newer than that ...
+[table_cache]   learning_activities   +12,340 new rows appended  (total: 4,835,381)
+```
+
+**Per-chunk allocation source:**
+```
+[cache] Chunk 1 allocation → DuckDB (170,541 rows)
+[s3_completion] learning_activities → 14,920 rows  [DuckDB cache]
+```
+
+---
+
+### Cache Commands
+
+| Scenario | Command |
+|---|---|
+| First time on a new server | `python3 main.py --force-refresh` |
+| Normal daily run | `python3 main.py` (incremental by default) |
+| Allocation tables changed | `python3 main.py` (auto-detected, full rebuild triggered) |
+| Force full cache rebuild | `python3 main.py --force-refresh` |
+| Update cache manually | `python3 main.py --force-refresh` |
+| Cache file corrupted | `rm cache.duckdb` then `python3 main.py --force-refresh` |
+
+> **`cache.duckdb` is gitignored** — it is never committed. Each server maintains its own local cache file. On a new server, run `python3 main.py --force-refresh` to build the cache from scratch.
+
+> **`--force-refresh` rebuilds everything** — source tables, completion tables (full batch), and allocation result cache. Normal runs (`python3 main.py`) use incremental refresh for completion tables and skip source table re-download if nothing changed.
+
+---
+
+## Database Reference
+
+### Source Tables (`quest_rearch_production`)
+
+| Table | Role |
+|---|---|
+| `users` | User list — types 1–4, `status=1`, `deleted_at IS NULL` |
+| `student_details` | `batch_id`, `trade_id`, `educational_qualification_id`, etc. per learner |
+| `centre_subject` | Maps centre → subjects |
+| `batch_subject` | Maps batch → subjects |
+| `subject_trade` | Maps trade → subjects (non-PLE) |
+| `subject_ple_career_path` | Maps PLE career path → subjects |
+| `ple_career_path_user` | Maps user → career path (`job_type_id`) |
+| `ple_career_paths` | Career path master data |
+| `subjects` | Subject master |
+| `lessons` | Lesson master (`student_access`, `facilitator_access`, `mastertrainer_access`) |
+| `lesson_types` | Lesson type labels (Video, PDF, Assessment, etc.) |
+| `trades` | Trade master — `duration` (years) for year_to_map filter |
+| `learning_activities` | Completion for user types 3, 4 |
+| `facilitator_learning_activities` | Completion for user types 1, 2 |
+
+### Analytics Tables (`quest_analytics`)
+
+| Table | Role | Written by |
+|---|---|---|
+| `main_learning_activity_myquest_ael` | Subject-level, filtered (excludes pdf/mp4/pdf web) | `main.py` (Steps 1–3) |
+| `main_learning_activity_myquest_ael_all_lesson_type` | Subject-level, all lesson types | `main.py` (Steps 1–3) |
+| `main_learning_activity_myquest_ael_lesson` | Lesson-level detail, filtered | `main.py` (Steps 1–3) |
+| `main_wcc_json` | One row per user — project/phase and subject data as JSON | `main_wcc_json_v2.py` (Step 4) |
+
+---
+
+## Understanding `toolkit_type`
+
+Derived from access flags on the `lessons` table — not a stored column.
+
+| Value | Condition | Meaning |
+|---|---|---|
+| `student` | `lessons.student_access = 1` | Content for learners/alumni |
+| `facilitator` | `lessons.facilitator_access = 1` | Content for facilitators |
+| `master` | `lessons.mastertrainer_access = 1` | Content for master trainers |
+| `NULL` | None of the above set | No access flag configured |
+
+Learner/alumni rows will always have `toolkit_type = 'student'`. Staff rows will have `facilitator` or `master`.
+
+---
+
+## SSH Tunnel Architecture
+
+Both RDS instances are in private subnets accessible only through bastion hosts. The pipeline uses **paramiko** directly — no `sshtunnel` library.
+
+**Why not `sshtunnel`?** Version 0.4.0 references `paramiko.DSSKey` which was removed in paramiko 3.x.
+
+**How the tunnel works (`db.py`):**
+
+1. `paramiko.SSHClient` connects to the bastion server using the `.pem` private key.
+2. A local TCP socket binds to a free port on `127.0.0.1`.
+3. A background thread accepts TCP connections and bridges them through a `direct-tcpip` paramiko channel to the RDS endpoint.
+4. `pymysql.connect(host="127.0.0.1", port=<local_port>)` connects through the tunnel.
+5. Tunnel tears down when the context manager exits.
+
+```
+pymysql → 127.0.0.1:local_port → [paramiko direct-tcpip] → bastion → RDS
+```
+
+Each `fetch()` or `write_table()` call opens and closes its own tunnel. No persistent connection pool.
+
+---
+
+## Handling Allocation Changes
+
+The incremental mode (`--since`) only detects users with **new completions**. It does not detect changes to allocation structure (subjects/lessons added or removed). When allocation changes, stale rows remain in the DB for users who haven't completed anything since the change.
+
+### When allocation changes — what to do
+
+| Change type | Action |
+|---|---|
+| Subject / lessons added to a centre | `python main.py --centre-id <uuid> --output db` |
+| Subject / lessons removed from a centre | `python main.py --centre-id <uuid> --output db` |
+| Batch allocation changed | `python main.py --batch-id <uuid> --output db` |
+| Trade allocation changed | `python main.py --trade-id <uuid> --output db` |
+| Large structural change (many centres) | Full refresh: `python main.py --output db` |
+
+A scoped refresh by `--centre-id` / `--batch-id` / `--trade-id` recalculates and replaces rows only for users in that scope. It is much faster than a full refresh and surgically correct.
+
+> **Rule of thumb:** whenever the admin panel is used to add or remove subjects/lessons from a centre, batch, or trade — run the corresponding scoped refresh immediately afterward.
+
+### Why incremental mode doesn't catch this
+
+`--since` queries `learning_activities.completed_at` to find changed users. Allocation tables (`centre_subject`, `batch_subject`, `subject_trade`, `subject_ple_career_path`) have no corresponding event in the activity log — the pipeline has no way to know they changed unless told explicitly.
+
+### Recommended schedule
+
+```cron
+# Daily incremental — picks up new completions (fast, ~minutes)
+5 0 * * * cd /path/to/ael_v2_pipeline && venv/bin/python main.py \
+  --since "$(date -d 'yesterday' '+%Y-%m-%d 00:00:00')" --log-file /var/log/ael.log
+
+# Monthly full refresh — catches any allocation drift (slow, ~5h)
+0 1 1 * * cd /path/to/ael_v2_pipeline && venv/bin/python main.py --log-file /var/log/ael_full.log
+```
+
+---
 
 ## Troubleshooting
 
-### `TypeError: not enough arguments for format string`
+**Only two DB tables appear after running**
 
-This can happen when PyMySQL receives SQL containing literal `%` characters, such as:
+Make sure you are not using `--output csv` alone — the DB tables are only written when `--output db` (default) or `--output both` is used. The all-lesson-types table (`main_learning_activity_myquest_ael_all_lesson_type`) is always written alongside the other two on every DB run.
 
-```sql
-LIKE '%ASSESSMENT%'
-```
+**`--all-lesson-types` CSV files not appearing**
 
-The current `db.fetch()` implementation avoids that by calling `execute(sql)` when no query parameters are provided.
+The flag only adds CSV files — the DB table is always written regardless. Make sure you also pass `--output csv` or `--output both`, otherwise no CSV files are written at all.
 
-### Empty result for a centre
+**Duplicate lesson rows**
 
-The runner skips writes for centres that return no rows.
+Caused by a PLE user with more than one active career path. `fetch_allocation()` deduplicates automatically — the log line `deduplicated N duplicate (user_id, lesson_id) rows` confirms how many were dropped.
+
+**Empty allocation for a user**
+
+Common causes:
+1. `student_details` row missing: `SELECT * FROM student_details WHERE user_id = '<uuid>'`
+2. All subjects filtered by `year_to_map <= trade.duration`
+3. For PLE: no active `ple_career_path_user` record (`status=1, deleted_at IS NULL`)
+4. No `centre_subject` entries for the user's centre
+
+**Staff user has no allocation**
 
 Check:
+1. `users.centre_id` is set for the staff user
+2. The centre has entries in `centre_subject`
+3. For Facilitators: at least one lesson in the centre has `facilitator_access = 1`
+4. For Master Trainers: at least one lesson has `mastertrainer_access = 1`
 
-- the centre exists and is active
-- users exist for that centre
-- the SQL filters match the required user types
-- related project, batch, subject, and lesson mappings exist
+**Empty completion (allocation is non-empty but output is empty)**
 
-### Duplicate rows
+The user has no `completed = 1` records in `learning_activities` (or `facilitator_learning_activities`). This is expected for users who have been allocated but not yet started. Run `--dry-run` to confirm `total_allocated` is non-zero.
 
-If you rerun without `--replace-target`, rows are appended. Use `--replace-target` for a clean rebuild.
+**Pipeline slow on large runs**
+
+Use incremental mode (`--since`) for daily updates. Full refresh for 900K+ users takes ~5 hours. Reduce `ALLOC_CHUNK_SIZE` in `config.py` if you hit memory issues.
+
+**`AuthenticationException` on SSH connect**
+
+- Check `.pem` exists in `DB_Config/` with correct filename from `.env`
+- Set permissions: `chmod 400 DB_Config/<keyfile>.pem`
+- Verify SSH username matches the key
+
+**`No route to host` / `Connection timed out`**
+
+You need VPN or office network connectivity to reach the bastion hosts (`SOURCE_SSH_HOST`, `DEST_SSH_HOST` in `.env`).
+
+**`_duckdb.ParserException: Parser Error: syntax error at end of input` during `precompute_allocation`**
+
+This was caused by a greedy regex (`re.DOTALL`) stripping the `ORDER BY` inside the `_PLE_SQL` subquery (career path deduplication) instead of only the trailing top-level `ORDER BY`. Fixed in `s0_cache.py` — `_strip_trailing_order_by()` now walks `ORDER BY` occurrences from the end and only removes the one at paren depth 0.
+
+**`ModuleNotFoundError`**
+
+```bash
+source venv/bin/activate
+pip install -r requirements.txt
+```
