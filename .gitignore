@@ -17,6 +17,10 @@ build/
 # ── Pipeline output ───────────────────────────────────────────
 output/
 
+# ── Local SQL inputs that may contain real IDs ────────────────
+sql_queries/centre_ids.sql
+to_push_to_server.md
+
 # ── macOS ─────────────────────────────────────────────────────
 .DS_Store
 .AppleDouble
